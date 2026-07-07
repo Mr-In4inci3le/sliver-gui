@@ -11,7 +11,7 @@ files the official `sliver-client` uses.
 Sliver itself is written in Go and ships a reusable client package
 (`github.com/bishopfox/sliver/client` + `protobuf/{clientpb,rpcpb,sliverpb}`).
 Wails lets the Go backend import those packages directly and call the real
-generated gRPC stubs — no grpc-web proxy, no reimplementing the protocol in
+generated gRPC stubs no grpc-web proxy, no reimplementing the protocol in
 JS, and no drift when upstream changes their `.proto` files.
 
 ## Project layout
@@ -88,9 +88,9 @@ wails build
 - Saved HTTP(S) C2 profile listing
 - Connected operator presence list
 
-## Not yet built (good next steps)
+## Not yet built (next steps)
 
-- Interactive session console (shell/task streaming) — needs a tabbed
+- Interactive session console (shell/task streaming) needs a tabbed
   terminal view wired to session-scoped RPCs
 - File browser / process list per session
 - Loot browser
