@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"/><title>Sliver GUI</title><link rel="stylesheet" href="./style.css"/></head>
+<body>
+
+<!-- Toast container -->
+<div id="toasts" class="toasts"></div>
+
+<!-- Connect overlay -->
+<div id="connect-overlay" class="overlay">
+  <div class="connect-card">
+    <div class="logo">SLIVER<span>GUI</span></div>
+    <p class="subtitle">Connect via operator config</p>
+    <button id="pick-config-btn" class="btn primary full">[+] Select operator .cfg</button>
+    <div id="config-path" class="config-path"></div>
+    <button id="connect-btn" class="btn accent full" disabled>Connect</button>
+    <div id="connect-error" class="error-msg"></div>
+  </div>
+</div>
+
+<!-- Main shell (Cobalt Strike layout) -->
+<div id="app-shell" class="app-shell hidden">
+
+  <!-- Top toolbar -->
+  <div class="toolbar-main">
+    <div class="toolbar-left">
+      <span class="brand-sm">SLIVER<span>GUI</span></span>
+      <span class="sep">|</span>
+      <button class="tb-btn" data-view="sessions">Sessions</button>
+      <button class="tb-btn" data-view="beacons">Beacons</button>
+      <button class="tb-btn" data-view="listeners">Listeners</button>
+      <button class="tb-btn" data-view="generate">Generate</button>
+      <button class="tb-btn" data-view="builds">Builds</button>
+      <button class="tb-btn" data-view="profiles">Profiles</button>
+      <button class="tb-btn" data-view="events">Event Log</button>
+      <button class="tb-btn" data-view="loot">Loot</button>
+      <button class="tb-btn" data-view="operators">Operators</button>
+    </div>
+    <div class="toolbar-right">
+      <span id="server-version" class="version-tag"></span>
+      <span id="operator-tag" class="operator-tag"></span>
+      <button id="disconnect-btn" class="btn small">Disconnect</button>
+    </div>
+  </div>
+
+  <!-- Split layout: top=graph/table, bottom=interaction -->
+  <div class="split-layout">
+
+    <!-- Top panel: graph + table views -->
+    <div class="top-panel" id="top-panel">
+
+      <!-- View toggle -->
+      <div class="view-bar">
+        <button id="view-table-btn" class="vb-btn active">Table</button>
+        <button id="view-graph-btn" class="vb-btn">Graph</button>
+        <span class="spacer"></span>
+        <span id="agent-count" class="count-badge">0 sessions | 0 beacons</span>
+        <button id="refresh-all-btn" class="btn small">Refresh</button>
+      </div>
+
+      <!-- Table view -->
+      <div id="table-view" class="panel-content">
+        <div class="table-wrap">
+          <table class="data-table" id="agents-table">
+            <thead><tr>
+              <th>Type</th><th>Name / ID</th><th>Host</th><th>User</th><th>OS/Arch</th>
+              <th>PID</th><th>Transport</th><th>Remote</th><th>Last Checkin</th><th>Status</th>
+            </tr></thead>
+            <tbody id="agents-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Graph view -->
+      <div id="graph-view" class="panel-content hidden">
+        <svg id="graph-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+        <div class="graph-legend">
+          <span class="leg-item"><span class="leg-dot priv"></span> Privileged</span>
+          <span class="leg-item"><span class="leg-dot user"></span> User</span>
+          <span class="leg-item"><span class="leg-dot dead"></span> Dead</span>
+          <span class="sep">|</span>
+          <span class="leg-item">OS logo shown per node</span>
+          <span class="sep">|</span>
+          <span class="leg-item">drag nodes · scroll to zoom · drag bg to pan</span>
+          <span class="spacer"></span>
+          <button id="graph-reset-btn" class="btn small">Reset Layout</button>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Resize handle -->
+    <div class="resize-handle" id="resize-handle"></div>
+
+    <!-- Bottom panel: interaction console -->
+    <div class="bottom-panel" id="bottom-panel">
+      <div class="interact-bar">
+        <span class="interact-label" id="interact-label">No agent selected - double-click an agent above to interact</span>
+        <div id="interact-tabs" class="interact-tabs"></div>
+        <span class="spacer"></span>
+        <button id="notes-btn" class="btn small" title="Operator notes for this agent">📝 Notes</button>
+      </div>
+      <div id="interact-panels" class="interact-panels">
+        <div class="empty-interact" id="empty-interact">
+          <p>Double-click a session or beacon in the table/graph to open an interaction console.</p>
+          <p style="margin-top:8px;color:var(--muted)">Available views: Sessions, Beacons, Listeners, Generate, Event Log, Loot, Operators</p>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Reconnect overlay -->
+<div id="reconnect-overlay" class="overlay hidden">
+  <div class="connect-card">
+    <div class="logo">SLIVER<span>GUI</span></div>
+    <p class="subtitle" style="color:var(--accent)">Connection to teamserver lost</p>
+    <div id="reconnect-status" class="config-path">Reconnecting...</div>
+    <div class="reconnect-count">Next attempt in <span id="reconnect-count">10</span>s</div>
+    <button id="reconnect-now-btn" class="btn accent full">Retry now</button>
+    <button id="reconnect-cancel-btn" class="btn small full">Give up</button>
+  </div>
+</div>
+
+<!-- Modal window for config views (Generate, Listeners, Builds, Profiles, etc.) -->
+<div id="modal-overlay" class="modal-overlay hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <span id="modal-title" class="modal-title">Panel</span>
+      <button id="modal-close" class="modal-close">×</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
+<!-- Command palette (Ctrl+K) -->
+<div id="palette-overlay" class="palette-overlay hidden">
+  <div class="palette">
+    <input id="palette-input" class="palette-input" placeholder="Search agents & panels…  (↑↓ to move, Enter to open, Esc to close)" autocomplete="off"/>
+    <div id="palette-results" class="palette-results"></div>
+  </div>
+</div>
+
+<!-- Context menu -->
+<div id="ctx-menu" class="ctx-menu hidden">
+  <div class="ctx-item" id="ctx-interact">Interact</div>
+  <div class="ctx-item" id="ctx-rename">Rename</div>
+  <div class="ctx-divider"></div>
+  <div class="ctx-item danger" id="ctx-kill">Kill</div>
+</div>
+
+<script src="./main.js"></script>
+</body>
+</html>
