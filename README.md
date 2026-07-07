@@ -59,6 +59,24 @@ wails dev
 ```bash
 wails build
 ```
+## Screenshots
+<img width="1912" height="837" alt="1" src="https://github.com/user-attachments/assets/34de2c40-85d6-4d5f-b985-80f9d335e93d" />
+<br>
+<br />
+<img width="1912" height="842" alt="2" src="https://github.com/user-attachments/assets/11b4ffbd-5451-402d-b7b2-1c7ca40a4f37" />
+<br>
+<br />
+<img width="1907" height="826" alt="3" src="https://github.com/user-attachments/assets/7d5ae20f-0d29-415a-879c-e468fc60e7a0" />
+<br>
+<br />
+<img width="1907" height="832" alt="4" src="https://github.com/user-attachments/assets/1cbe4e8c-a261-49cd-8882-b5988b664928" />
+<br>
+<br />
+<img width="1904" height="837" alt="5" src="https://github.com/user-attachments/assets/86f36f9e-3bbe-4f9a-a436-7d6d38ed49c4" />
+<br>
+<br />
+<img width="1910" height="830" alt="6" src="https://github.com/user-attachments/assets/c15aa69d-7a46-4320-ba9f-8de90084cad5" />
+
 
 ## Current feature scope (v1)
 
