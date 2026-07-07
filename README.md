@@ -2,7 +2,7 @@
 
 A desktop operator console for [Sliver C2](https://github.com/BishopFox/sliver),
 in the spirit of Cobalt Strike / Havoc's GUIs. It does **not** reimplement any
-C2 protocol logic — it's a thin Wails (Go + web) frontend over Sliver's
+C2 protocol logic it's a thin Wails (Go + web) frontend over Sliver's
 existing `rpcpb.SliverRPC` gRPC service, using the same mTLS operator config
 files the official `sliver-client` uses.
 
