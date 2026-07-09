@@ -49,3 +49,14 @@ vendor/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Named test implants used during development
+rootlinux
+ws01
+beacon
+beacon.exe
+svc
+svc.exe
+winnew*
+test.exe
+win.exe
