@@ -103,6 +103,9 @@ input::placeholder{color:var(--muted);}
 .data-table tbody tr.selected{background:var(--panel-hi);}
 .type-session{color:#5cd68e;font-weight:700;font-size:9.5px;background:rgba(53,196,107,.1);border:1px solid rgba(53,196,107,.28);padding:2px 8px;border-radius:4px;letter-spacing:.5px;}
 .type-beacon{color:#79b7ec;font-weight:700;font-size:9.5px;background:rgba(77,159,230,.1);border:1px solid rgba(77,159,230,.28);padding:2px 8px;border-radius:4px;letter-spacing:.5px;}
+.user-priv{color:var(--accent);font-weight:700;}
+.row-priv td:first-child{box-shadow:inset 3px 0 0 var(--warn);}
+.data-table tbody tr.row-priv:hover td:first-child{box-shadow:inset 3px 0 0 var(--accent);}
 .status-alive{color:var(--ok);font-weight:600;}
 .status-alive::before{content:"●";margin-right:5px;color:var(--ok);}
 .status-dead{color:var(--accent);font-weight:600;}
@@ -113,14 +116,20 @@ input::placeholder{color:var(--muted);}
 #graph-svg{width:100%;height:100%;display:block;position:relative;z-index:1;}
 .gedge{stroke:var(--ok);stroke-width:2.5;opacity:.7;stroke-linecap:round;}
 .gedge.beacon{stroke:var(--info);stroke-dasharray:7 5;}
+.gedge.priv{stroke:var(--accent);stroke-width:3;opacity:.9;}   /* privileged agent (SYSTEM/admin) */
 .gedge.dead{stroke:var(--muted);stroke-width:1.5;opacity:.3;stroke-dasharray:2 6;}
 .gnode{transition:filter .12s ease;}
 .gnode:hover{filter:brightness(1.25);}
-.gnode.dead{filter:grayscale(1) opacity(.5);}
-.gnode.dead:hover{filter:grayscale(1) opacity(.7);}
+.gnode.dead{opacity:.75;}          /* dedicated DEAD icon conveys the state */
+.gnode.dead:hover{opacity:1;}
 .graph-legend{position:absolute;bottom:0;left:0;right:0;display:flex;gap:12px;padding:6px 12px;background:rgba(11,12,17,.94);border-top:1px solid var(--border);font-size:10.5px;color:var(--text-dim);align-items:center;}
 .leg-item{display:flex;align-items:center;gap:5px;}
 .leg-dot{width:9px;height:9px;border-radius:2px;}
+.leg-line{display:inline-block;width:18px;height:0;border-top:3px solid var(--muted);vertical-align:middle;}
+.leg-line.priv{border-top-color:var(--accent);}
+.leg-line.user{border-top-color:var(--ok);}
+.leg-line.beacon{border-top:3px dashed var(--info);}
+.leg-line.dead{border-top:3px dashed var(--muted);opacity:.5;}
 .leg-dot.priv{background:var(--accent);}
 .leg-dot.user{background:var(--ok);}
 .leg-dot.dead{background:var(--muted);}

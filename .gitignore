@@ -1,0 +1,51 @@
+# ── Build output ─────────────────────────────────────────────
+build/bin/
+build/*.o
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Wails generated bindings/dev artifacts
+frontend/wailsjs/
+frontend/dist/wailsjs/
+node_modules/
+
+# ── Operator credentials — NEVER commit these ────────────────
+# Sliver operator config files contain live mTLS keys + auth tokens.
+*.cfg
+*.pem
+*.key
+*.p12
+operators/
+configs/
+
+# ── Downloaded loot / implants / dumps ───────────────────────
+# Avoid committing anything pulled off a target or generated.
+*.dmp
+*.bin
+loot/
+implants/
+downloads/
+# Generated Sliver implants (our GUI names them <goos>-<goarch>-<id>[.exe],
+# which also catches extension-less Linux ELF implants).
+*-amd64-*
+*-386-*
+*-arm64-*
+# Common offensive tool binaries you may have staged locally.
+mimikatz*
+Rubeus*
+GodPotato*
+nanodump*
+
+# ── Go ───────────────────────────────────────────────────────
+vendor/
+*.test
+*.out
+
+# ── Editor / OS cruft ────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

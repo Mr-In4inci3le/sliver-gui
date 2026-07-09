@@ -34,6 +34,8 @@
       <button class="tb-btn" data-view="profiles">Profiles</button>
       <button class="tb-btn" data-view="events">Event Log</button>
       <button class="tb-btn" data-view="loot">Loot</button>
+      <button class="tb-btn" data-view="creds">Creds</button>
+      <button class="tb-btn" data-view="hosts">Hosts</button>
       <button class="tb-btn" data-view="operators">Operators</button>
     </div>
     <div class="toolbar-right">
@@ -75,11 +77,12 @@
       <div id="graph-view" class="panel-content hidden">
         <svg id="graph-svg" xmlns="http://www.w3.org/2000/svg"></svg>
         <div class="graph-legend">
-          <span class="leg-item"><span class="leg-dot priv"></span> Privileged</span>
-          <span class="leg-item"><span class="leg-dot user"></span> User</span>
-          <span class="leg-item"><span class="leg-dot dead"></span> Dead</span>
+          <span class="leg-item"><span class="leg-line priv"></span> Privileged (red)</span>
+          <span class="leg-item"><span class="leg-line user"></span> User session (green)</span>
+          <span class="leg-item"><span class="leg-line beacon"></span> Beacon (blue dashed)</span>
+          <span class="leg-item"><span class="leg-line dead"></span> Dead (grey)</span>
           <span class="sep">|</span>
-          <span class="leg-item">OS logo shown per node</span>
+          <span class="leg-item">OS logo + integrity shown per node</span>
           <span class="sep">|</span>
           <span class="leg-item">drag nodes · scroll to zoom · drag bg to pan</span>
           <span class="spacer"></span>
@@ -145,6 +148,7 @@
 <!-- Context menu -->
 <div id="ctx-menu" class="ctx-menu hidden">
   <div class="ctx-item" id="ctx-interact">Interact</div>
+  <div class="ctx-item" id="ctx-integrity">Check Integrity</div>
   <div class="ctx-item" id="ctx-rename">Rename</div>
   <div class="ctx-divider"></div>
   <div class="ctx-item danger" id="ctx-kill">Kill</div>
