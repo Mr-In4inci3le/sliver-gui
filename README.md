@@ -46,6 +46,10 @@ directly: no grpc-web proxy, no protocol reimplementation, no drift when upstrea
 <img width="1912" height="832" alt="image" src="https://github.com/user-attachments/assets/5db41809-17f4-40e2-bf7c-20a5a4901666" />
 <br><br>
 <img width="1912" height="756" alt="image" src="https://github.com/user-attachments/assets/b779ca54-7b43-4d0d-b066-66e25d7f73aa" />
+<br><br>
+<img width="1912" height="802" alt="image" src="https://github.com/user-attachments/assets/e43bcdc2-3c84-4ad2-8010-aa43c88d4b5d" />
+<br><br>
+<img width="1913" height="807" alt="Screenshot 2026-07-18 014308" src="https://github.com/user-attachments/assets/5780d98a-8e5e-4683-90bc-3649587d4b00" />
 
 ---
 
