@@ -35,11 +35,14 @@ jobs:
       - name: go vet
         run: go vet -tags webkit2_41 ./...
 
+      # golangci-lint v2 (config is v2 schema). Install a pinned version and run
+      # it directly so the result is deterministic and independent of the
+      # golangci-lint-action major version. Build tags come from .golangci.yml
+      # (run.build-tags: webkit2_41).
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
-          args: --build-tags webkit2_41 --timeout 5m
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+          "$(go env GOPATH)/bin/golangci-lint" run ./...
 
       - name: go test
         run: go test -tags webkit2_41 -race -count=1 ./...
