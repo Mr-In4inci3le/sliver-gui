@@ -13,8 +13,11 @@ import (
 var assets embed.FS
 
 // appIcon is the window/taskbar icon (the app logo) shown by the window manager.
+// Embed the source icon (frontend/icons/) rather than the build-copied
+// frontend/dist/icons/ — the latter is gitignored (dist/), so it isn't present
+// on a fresh checkout / in CI.
 //
-//go:embed frontend/dist/icons/ICON.png
+//go:embed frontend/icons/ICON.png
 var appIcon []byte
 
 func main() {
