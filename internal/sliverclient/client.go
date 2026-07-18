@@ -105,7 +105,7 @@ func Connect(cfg OperatorConfig) (*Client, error) {
 
 	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
-		grpc.WithBlock(),
+		grpc.WithBlock(), //nolint:staticcheck // intentional blocking dial so Connect fails fast on an unreachable teamserver; supported throughout gRPC 1.x
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(maxMsgSize),
 			grpc.MaxCallSendMsgSize(maxMsgSize),

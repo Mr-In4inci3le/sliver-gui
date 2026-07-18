@@ -165,7 +165,7 @@ func (a *App) StopInteractiveShell(tunnelID string) error {
 		return nil
 	}
 	if client, err := a.requireClient(); err == nil {
-		client.RPC.CloseTunnel(a.ctx, &sliverpb.Tunnel{TunnelID: h.tunnelID, SessionID: h.sessionID})
+		_, _ = client.RPC.CloseTunnel(a.ctx, &sliverpb.Tunnel{TunnelID: h.tunnelID, SessionID: h.sessionID})
 	}
 	a.cleanupShell(tunnelID)
 	return nil
@@ -177,7 +177,7 @@ func (a *App) cleanupShell(tunnelID string) {
 	delete(a.shells, tunnelID)
 	a.advMu.Unlock()
 	if h != nil {
-		h.stream.CloseSend()
+		_ = h.stream.CloseSend()
 		h.cancel()
 	}
 }

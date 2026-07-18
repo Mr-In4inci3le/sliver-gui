@@ -2239,7 +2239,7 @@ func (a *App) socksHandleConn(ctx context.Context, client *sliverclient.Client, 
 	if err != nil {
 		return
 	}
-	defer client.RPC.CloseSocks(ctx, &sliverpb.Socks{TunnelID: tunnelID})
+	defer func() { _, _ = client.RPC.CloseSocks(ctx, &sliverpb.Socks{TunnelID: tunnelID}) }()
 	var seq uint64
 
 	// stream -> local conn
@@ -2281,13 +2281,13 @@ func (a *App) socksHandleConn(ctx context.Context, client *sliverclient.Client, 
 			break
 		}
 	}
-	stream.Send(&sliverpb.SocksData{
+	_ = stream.Send(&sliverpb.SocksData{
 		TunnelID:  tunnelID,
 		CloseConn: true,
 		Sequence:  seq,
 		Request:   &commonpb.Request{SessionID: sessionID},
 	})
-	stream.CloseSend()
+	_ = stream.CloseSend()
 }
 
 // ─── Port Forwarding ───────────────────────────────────────────────────────────
@@ -2384,7 +2384,7 @@ func (a *App) portfwdHandleConn(ctx context.Context, client *sliverclient.Client
 	var seq uint64
 
 	// First frame: tell the implant where to dial (see NOTE above).
-	stream.Send(&sliverpb.TunnelData{TunnelID: tunnelID, Data: []byte(remote), Sequence: seq})
+	_ = stream.Send(&sliverpb.TunnelData{TunnelID: tunnelID, Data: []byte(remote), Sequence: seq})
 	seq++
 
 	// stream -> local conn
@@ -2425,9 +2425,9 @@ func (a *App) portfwdHandleConn(ctx context.Context, client *sliverclient.Client
 			break
 		}
 	}
-	stream.Send(&sliverpb.TunnelData{TunnelID: tunnelID, Closed: true, Sequence: seq})
-	stream.CloseSend()
-	client.RPC.CloseTunnel(ctx, &sliverpb.Tunnel{TunnelID: tunnelID, SessionID: sessionID})
+	_ = stream.Send(&sliverpb.TunnelData{TunnelID: tunnelID, Closed: true, Sequence: seq})
+	_ = stream.CloseSend()
+	_, _ = client.RPC.CloseTunnel(ctx, &sliverpb.Tunnel{TunnelID: tunnelID, SessionID: sessionID})
 }
 
 // ─── Token / Privilege (Windows) ───────────────────────────────────────────────
