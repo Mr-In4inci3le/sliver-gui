@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Sliver GUI
+Comment=Sliver C2 operator console
+Exec=/home/kali/Desktop/sliver-gui/v4/build/bin/sliver-gui
+Icon=/home/kali/.local/share/icons/sliver-gui.png
+Terminal=false
+StartupWMClass=Sliver-gui
+Categories=Utility;Security;

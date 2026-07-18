@@ -14,6 +14,34 @@ const notesMap = {};          // agent id -> operator notes (in-memory, cleared 
 const integrityMap = {};      // agent id -> real integrity level from getprivs (System/High/Medium/Low)
 let activeInteractId = null;  // currently focused agent tab
 
+// ── Persistence ─────────────────────────────────────────────────────────────
+// Operator notes, measured integrity, and graph layout survive disconnects and
+// app restarts, scoped per teamserver, in localStorage. (Previously in-memory
+// only, so they were lost on every reconnect.)
+let persistKey = null;        // set once we know which teamserver we're on
+let saveTimer = null;
+function persistScope(teamserver) { persistKey = 'sliver-gui:' + (teamserver || 'default'); }
+function saveState() {
+  if (!persistKey) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(persistKey, JSON.stringify({
+        notes: notesMap, integrity: integrityMap, graph: graphPos, v: 1,
+      }));
+    } catch (e) { /* quota/private-mode: state stays in-memory only */ }
+  }, 300);
+}
+function loadState() {
+  if (!persistKey) return;
+  let data;
+  try { data = JSON.parse(localStorage.getItem(persistKey) || '{}'); } catch (e) { return; }
+  if (!data || typeof data !== 'object') return;
+  Object.assign(notesMap, data.notes || {});
+  Object.assign(integrityMap, data.integrity || {});
+  Object.assign(graphPos, data.graph || {});
+}
+
 // ── Utils ──────────────────────────────────────────────────────────────────
 function esc(s) { return s == null ? '' : String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function toast(type, msg, dur=3000) {
@@ -65,6 +93,7 @@ document.getElementById('pick-config-btn').addEventListener('click', async () =>
   const path = await App().PickConfigFile().catch(() => null);
   if (path) { selectedConfigPath = path; document.getElementById('config-path').textContent = path; document.getElementById('connect-btn').disabled = false; }
 });
+document.getElementById('manual-cfg-path').addEventListener('input', function() { var p = this.value.trim(); if (p) { selectedConfigPath = p; document.getElementById('config-path').textContent = p; document.getElementById('connect-btn').disabled = false; } });
 document.getElementById('connect-btn').addEventListener('click', async () => {
   const btn = document.getElementById('connect-btn');
   btn.disabled = true; btn.textContent = 'Connecting...';
@@ -79,6 +108,8 @@ async function enterApp(info) {
   document.getElementById('app-shell').classList.remove('hidden');
   document.getElementById('operator-tag').textContent = `${info.operatorName}@${info.teamserver}`;
   teamserverLabel = info.teamserver || 'teamserver';
+  persistScope(teamserverLabel);
+  loadState();
   const ver = await App().GetVersion().catch(() => null);
   if (ver) document.getElementById('server-version').textContent = `v${ver.major}.${ver.minor}.${ver.patch}`;
   wireEventStream();
@@ -145,6 +176,7 @@ function renderEventsList() {
 async function refreshAgents() {
   allSessions = await App().ListSessions().catch(() => []) || [];
   allBeacons = await App().ListBeacons().catch(() => []) || [];
+  pivotTree = await App().GetPivotGraph().catch(() => []) || [];
   document.getElementById('agent-count').textContent = `${allSessions.length} sessions | ${allBeacons.length} beacons`;
   renderTable();
   if (!document.getElementById('graph-view').classList.contains('hidden')) renderGraph();
@@ -181,91 +213,172 @@ document.getElementById('view-graph-btn').addEventListener('click', () => { docu
 document.getElementById('graph-reset-btn').addEventListener('click', resetGraph);
 
 // ── Graph view (premium Cobalt-Strike style) ────────────────────────────────
+let pivotTree = [], graphEdges = [], graphDrag = {};
+
+// buildPivotMaps flattens Sliver's pivot tree into child-session-id -> parent-
+// session-id. Keying on session id (unique) instead of hostname means pivot chains
+// on the SAME host (e.g. several runas'd sessions on one box) resolve correctly.
+// A relay node without a session passes its own parent down to its children.
+function buildPivotMaps() {
+  const parentById = {};
+  const walk = (nd, parentId) => {
+    const id = nd.sessionId || null;
+    if (parentId && id) parentById[id] = parentId;
+    (nd.children || []).forEach(c => walk(c, id || parentId));
+  };
+  (pivotTree || []).forEach(r => walk(r, null));
+  return { parentById };
+}
+
+// edgeD builds a straight edge path shortened at both ends so the arrowhead sits
+// on the target node's edge (not under its icon). srcR/tgtR are the radii to inset.
+function edgeD(src, tgt, srcR, tgtR) {
+  const dx = tgt.x - src.x, dy = tgt.y - src.y, len = Math.hypot(dx, dy) || 1;
+  const ux = dx / len, uy = dy / len;
+  const ax = src.x + ux * srcR, ay = src.y + uy * srcR;
+  const bx = tgt.x - ux * tgtR, by = tgt.y - uy * tgtR;
+  return `M${ax.toFixed(1)} ${ay.toFixed(1)} L${bx.toFixed(1)} ${by.toFixed(1)}`;
+}
+// edgeColor picks the line colour from the agent it points at: blue=beacon,
+// red=privileged session, green=normal session.
+function edgeColor(nd) {
+  if (!nd) return '#35c46b';
+  if (nd.kind === 'beacon') return '#4d9fe6';
+  return isPrivileged(nd.obj) ? '#e23c4e' : '#35c46b';
+}
+
+// renderGraph draws the pivot topology: a firewall egress boundary on the left,
+// green dashed edges to direct (egress) agents and orange edges down each pivot
+// chain (parent -> child), laid out left-to-right. Wrapped in try/catch so a data
+// hiccup can never blank the view.
 function renderGraph() {
   const svg = document.getElementById('graph-svg');
   if (!svg) return;
-  const nodes = [
-    ...allSessions.map(s => ({ kind:'session', obj:s })),
-    ...allBeacons.map(b => ({ kind:'beacon', obj:b })),
-  ];
-  const W = svg.clientWidth || 900, H = svg.clientHeight || 460;
-  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
-  if (!graphCenter) graphCenter = { x: W/2, y: H/2 };
-  const cx = graphCenter.x, cy = graphCenter.y, baseR = Math.min(W, H)/2 - 78;
+  try {
+    const nodes = [
+      ...allSessions.map(s => ({ kind:'session', obj:s })),
+      ...allBeacons.map(b => ({ kind:'beacon', obj:b })),
+    ];
+    const W = svg.clientWidth || 900, H = svg.clientHeight || 460;
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    const fwX = 74, fwY = H / 2;
 
-  // Assign a persistent position to each node (ring layout for new ones).
-  const n = nodes.length;
-  nodes.forEach((nd, i) => {
-    if (!graphPos[nd.obj.id]) {
-      const ring = n > 9 && i%2 ? 0.62 : 1, r = baseR * ring;
-      const a = (i/Math.max(n,1))*2*Math.PI - Math.PI/2;
-      graphPos[nd.obj.id] = { x: cx + r*Math.cos(a), y: cy + r*Math.sin(a) };
+    // Resolve each node's pivot parent by SESSION ID (unique), so chains on the
+    // same host render as a real chain instead of collapsing on the hostname.
+    const nodeById = {}; nodes.forEach(nd => nodeById[nd.obj.id] = nd);
+    const { parentById } = buildPivotMaps();
+    const parentNodeId = {}, childIds = {};
+    nodes.forEach(nd => {
+      const pid = parentById[nd.obj.id];
+      if (pid && nodeById[pid] && pid !== nd.obj.id) {
+        parentNodeId[nd.obj.id] = pid;
+        (childIds[pid] = childIds[pid] || []).push(nd.obj.id);
+      }
+    });
+    const roots = nodes.filter(nd => !parentNodeId[nd.obj.id]).map(nd => nd.obj.id);
+
+    // Hierarchical left-to-right layout: depth = column, each leaf gets its own row.
+    const layout = {}, colW = 192, rowH = 96;
+    let leaf = 0;
+    const place = (id, depth, seen) => {
+      if (seen[id]) return layout[id] ? layout[id].y : (60 + leaf * rowH);
+      seen[id] = 1;
+      const kids = (childIds[id] || []).filter(k => !seen[k]);
+      const x = fwX + depth * colW;
+      let y;
+      if (!kids.length) { y = 60 + leaf * rowH; leaf++; }
+      else { const ys = kids.map(k => place(k, depth + 1, seen)); y = ys.reduce((a,b)=>a+b,0)/ys.length; }
+      layout[id] = { x, y };
+      return y;
+    };
+    const seen = {};
+    roots.forEach(r => place(r, 1, seen));
+    const yvals = Object.values(layout).map(p => p.y);
+    if (yvals.length) {
+      const mid = (Math.min(...yvals) + Math.max(...yvals)) / 2, shift = H/2 - mid;
+      Object.values(layout).forEach(p => p.y += shift);
     }
-  });
+    svg._layout = layout; svg._fwX = fwX; svg._fwY = fwY;
+    const posOf = id => graphDrag[id] || layout[id] || { x: fwX + colW, y: H/2 };
+    const NODE_R = 30, FW_R = 34;
 
-  // Straight edges (do not bend).
-  const edgePath = (x1,y1,x2,y2) => `M${x1} ${y1} L${x2} ${y2}`;
+    // Edge list: firewall -> root (egress), parent -> child (pivot).
+    graphEdges = [];
+    roots.forEach(id => graphEdges.push({ from:'__fw__', to:id }));
+    nodes.forEach(nd => { const p = parentNodeId[nd.obj.id]; if (p) graphEdges.push({ from:p, to:nd.obj.id }); });
 
-  let html = `<g id="g-root" transform="translate(${graphView.tx},${graphView.ty}) scale(${graphView.scale})">`;
+    const fwPos = { x: fwX, y: fwY };
+    let html = '<defs>' +
+      '<marker id="ar-green" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#35c46b"/></marker>' +
+      '<marker id="ar-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#e23c4e"/></marker>' +
+      '<marker id="ar-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#4d9fe6"/></marker>' +
+      '</defs>';
+    html += `<g id="g-root" transform="translate(${graphView.tx},${graphView.ty}) scale(${graphView.scale})">`;
 
-  // Edges (straight; dashed for beacons; red for privileged agents)
-  nodes.forEach(nd => {
-    const p = graphPos[nd.obj.id], dead = nd.obj.isDead, priv = isPrivileged(nd.obj);
-    const cls = `gedge${nd.kind==='beacon'?' beacon':''}${priv&&!dead?' priv':''}${dead?' dead':''}`;
-    html += `<path id="ge-${nd.obj.id}" d="${edgePath(cx,cy,p.x,p.y)}" class="${cls}" fill="none"/>`;
-  });
+    // Solid edges, coloured by the agent they point at, arrowhead at the node edge.
+    graphEdges.forEach(ed => {
+      const src = ed.from === '__fw__' ? fwPos : posOf(ed.from), tgt = posOf(ed.to);
+      const col = edgeColor(nodeById[ed.to]);
+      const mk = col === '#4d9fe6' ? 'ar-blue' : (col === '#e23c4e' ? 'ar-red' : 'ar-green');
+      const eid = `ge-${ed.from}-${ed.to}`;
+      html += `<path id="${eid}" d="${edgeD(src, tgt, ed.from === '__fw__' ? FW_R : NODE_R, NODE_R + 3)}" stroke="${col}" stroke-width="2.4" fill="none" marker-end="url(#${mk})"/>`;
+    });
 
-  // Teamserver core — C2 icon
-  html += `<image href="./icons/C2.png" x="${cx-30}" y="${cy-30}" width="60" height="60" pointer-events="none"/>`;
-  html += `<text x="${cx}" y="${cy+48}" text-anchor="middle" fill="var(--accent)" font-size="10" font-weight="bold" font-family="var(--font)" pointer-events="none">${esc(teamserverLabel)}</text>`;
+    // Firewall (egress boundary): brick wall + flame.
+    html += `<g pointer-events="none" transform="translate(${fwX},${fwY})">`;
+    const bw = 15, bh = 9;
+    for (let r = 0; r < 5; r++) { const oy = -22 + r*bh, off = (r%2) ? bw/2 : 0; for (let c = -1; c < 2; c++) html += `<rect x="${c*bw+off-7}" y="${oy}" width="${bw-1.5}" height="${bh-1.5}" fill="#9a3b2e" stroke="#5f231b" stroke-width="0.8"/>`; }
+    html += '<text x="-19" y="7" font-size="30" text-anchor="middle">🔥</text>';
+    html += '<text y="42" text-anchor="middle" fill="var(--muted)" font-size="9" font-family="var(--mono)">egress</text>';
+    html += '</g>';
 
-  // Agent nodes — icon from the icons folder; grey filter when dead.
-  nodes.forEach(nd => {
-    const o = nd.obj, p = graphPos[o.id];
-    const dead = o.isDead, priv = isPrivileged(o);
-    const labelColor = dead ? 'var(--muted)' : 'var(--text)';
-    html += `<g class="gnode${dead?' dead':''}" data-id="${esc(o.id)}" transform="translate(${p.x},${p.y})" style="cursor:grab">`;
-    // Transparent hit area so the group receives drag/dblclick (images below are inert).
-    html += `<rect x="-28" y="-32" width="56" height="86" fill="transparent"/>`;
-    html += `<image href="${osIconHref(o.os, priv, dead)}" x="-26" y="-26" width="52" height="52" pointer-events="none"/>`;
-    html += `<text y="38" text-anchor="middle" fill="${labelColor}" font-size="10" font-weight="bold" font-family="var(--font)" pointer-events="none">${esc(o.hostname||o.id.slice(0,6))}</text>`;
-    html += `<text y="50" text-anchor="middle" fill="var(--muted)" font-size="8.5" font-family="var(--mono)" pointer-events="none">${esc(shortUser(o.username))} · ${nd.kind}</text>`;
-    if (priv && !dead) html += `<text y="-30" text-anchor="middle" fill="var(--accent)" font-size="8" font-weight="bold" font-family="var(--mono)" pointer-events="none">★ ${integrityLabel(o) || 'PRIV'}</text>`;
-    if (dead) html += `<text y="-30" text-anchor="middle" fill="var(--muted)" font-size="8" font-weight="bold" font-family="var(--mono)" pointer-events="none">DEAD</text>`;
-    html += `</g>`;
-  });
+    // Agent nodes: icon (blue=user, red=privileged), lightning bolts when privileged.
+    nodes.forEach(nd => {
+      const o = nd.obj, p = posOf(o.id), dead = o.isDead, priv = isPrivileged(o);
+      html += `<g class="gnode${dead?' dead':''}" data-id="${esc(o.id)}" transform="translate(${p.x},${p.y})" style="cursor:grab">`;
+      html += '<rect x="-30" y="-34" width="60" height="94" fill="transparent"/>';
+      if (o.id === activeInteractId) html += '<rect x="-33" y="-33" width="66" height="64" rx="4" fill="none" stroke="#35c46b" stroke-width="1.5" stroke-dasharray="5 4"/>';
+      html += `<image href="${osIconHref(o.os, priv, dead)}" x="-26" y="-26" width="52" height="52" pointer-events="none"/>`;
+      const user = shortUser(o.username) + (priv && !dead ? ' *' : '');
+      const l2 = `${o.hostname || o.id.slice(0,6)}${o.pid ? ' @ ' + o.pid : ''}`;
+      const lc = dead ? 'var(--muted)' : (priv ? 'var(--accent)' : 'var(--text)');
+      html += `<text y="40" text-anchor="middle" fill="${lc}" font-size="10" font-weight="bold" font-family="var(--font)" pointer-events="none">${esc(user)}</text>`;
+      html += `<text y="51" text-anchor="middle" fill="var(--muted)" font-size="8.5" font-family="var(--mono)" pointer-events="none">${esc(l2)}</text>`;
+      if (dead) html += '<text y="-30" text-anchor="middle" fill="var(--muted)" font-size="8" font-weight="bold" font-family="var(--mono)" pointer-events="none">DEAD</text>';
+      html += '</g>';
+    });
 
-  html += `</g>`;
-  svg.innerHTML = html;
+    html += '</g>';
+    svg.innerHTML = html;
 
-  // dblclick on a live node opens its console.
-  const byId = {}; nodes.forEach(nd => byId[nd.obj.id] = nd);
-  svg.querySelectorAll('.gnode').forEach(el => {
-    const nd = byId[el.dataset.id];
-    if (nd && !nd.obj.isDead) el.addEventListener('dblclick', () => openInteract(nd.kind, nd.obj));
-  });
-
-  setupGraphInteraction(svg, cx, cy, edgePath);
+    const byId = {}; nodes.forEach(nd => byId[nd.obj.id] = nd);
+    svg.querySelectorAll('.gnode').forEach(el => {
+      const nd = byId[el.dataset.id];
+      if (nd && !nd.obj.isDead) el.addEventListener('dblclick', () => openInteract(nd.kind, nd.obj));
+    });
+    setupGraphInteraction(svg);
+  } catch (err) { console.error('renderGraph failed:', err); }
 }
 
-// setupGraphInteraction wires drag (nodes), pan (background) and wheel zoom.
-// Attached once per svg element; survives innerHTML re-renders.
-function setupGraphInteraction(svg, cx, cy, edgePath) {
-  if (svg._wired) { svg._cx = cx; svg._cy = cy; svg._edgePath = edgePath; return; }
-  svg._wired = true; svg._cx = cx; svg._cy = cy; svg._edgePath = edgePath;
+// setupGraphInteraction wires node drag, canvas pan and wheel zoom. Attached once
+// per svg element; reads live layout/firewall coords off the svg each render.
+function setupGraphInteraction(svg) {
+  if (svg._wired) return;
+  svg._wired = true;
   let mode = null, dragId = null, startX = 0, startY = 0, origX = 0, origY = 0;
 
   const applyView = () => {
     const root = document.getElementById('g-root');
     if (root) root.setAttribute('transform', `translate(${graphView.tx},${graphView.ty}) scale(${graphView.scale})`);
   };
+  const posOf = id => graphDrag[id] || (svg._layout && svg._layout[id]) || { x: (svg._fwX||74) + 192, y: svg._fwY || 0 };
 
   svg.addEventListener('mousedown', e => {
     const nodeEl = e.target.closest('.gnode');
     startX = e.clientX; startY = e.clientY;
     if (nodeEl) {
       mode = 'node'; dragId = nodeEl.dataset.id;
-      origX = graphPos[dragId].x; origY = graphPos[dragId].y;
+      const pp = posOf(dragId); origX = pp.x; origY = pp.y;
       nodeEl.style.cursor = 'grabbing';
     } else {
       mode = 'pan'; origX = graphView.tx; origY = graphView.ty;
@@ -279,11 +392,15 @@ function setupGraphInteraction(svg, cx, cy, edgePath) {
     if (mode === 'node') {
       const dx = (e.clientX - startX)/graphView.scale, dy = (e.clientY - startY)/graphView.scale;
       const nx = origX + dx, ny = origY + dy;
-      graphPos[dragId] = { x: nx, y: ny };
+      graphDrag[dragId] = { x: nx, y: ny };
       const g = svg.querySelector(`.gnode[data-id="${CSS.escape(dragId)}"]`);
       if (g) g.setAttribute('transform', `translate(${nx},${ny})`);
-      const edge = document.getElementById(`ge-${dragId}`);
-      if (edge) edge.setAttribute('d', svg._edgePath(svg._cx, svg._cy, nx, ny));
+      (graphEdges || []).forEach(ed => {
+        if (ed.from !== dragId && ed.to !== dragId) return;
+        const src = ed.from === '__fw__' ? { x: svg._fwX, y: svg._fwY } : posOf(ed.from), tgt = posOf(ed.to);
+        const el = document.getElementById(`ge-${ed.from}-${ed.to}`);
+        if (el) el.setAttribute('d', edgeD(src, tgt, ed.from === '__fw__' ? 34 : 30, 33));
+      });
     } else if (mode === 'pan') {
       graphView.tx = origX + (e.clientX - startX);
       graphView.ty = origY + (e.clientY - startY);
@@ -303,7 +420,6 @@ function setupGraphInteraction(svg, cx, cy, edgePath) {
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
     const factor = e.deltaY < 0 ? 1.12 : 1/1.12;
     const ns = Math.min(3, Math.max(0.3, graphView.scale * factor));
-    // Keep the point under the cursor fixed while zooming.
     graphView.tx = mx - (mx - graphView.tx) * (ns/graphView.scale);
     graphView.ty = my - (my - graphView.ty) * (ns/graphView.scale);
     graphView.scale = ns;
@@ -314,6 +430,7 @@ function setupGraphInteraction(svg, cx, cy, edgePath) {
 // Reset the graph layout/view to its default.
 function resetGraph() {
   for (const k in graphPos) delete graphPos[k];
+  for (const k in graphDrag) delete graphDrag[k];
   graphView = { tx: 0, ty: 0, scale: 1 };
   graphCenter = null;
   renderGraph();
@@ -338,6 +455,7 @@ document.getElementById('ctx-integrity').addEventListener('click', async () => {
   const r = await App().GetPrivs(obj.id).catch(() => null);
   if (!r || !r.integrity) return toast('err', 'getprivs failed (needs a live Windows session)');
   integrityMap[obj.id] = r.integrity;
+  saveState();
   const label = integrityLabel(obj) || r.integrity;
   toast(isPrivileged(obj) ? 'ok' : 'info', `${obj.hostname}: ${label} integrity`);
   renderTable();
@@ -403,6 +521,12 @@ function activateTab(id) {
   document.getElementById(`cinp-${id}`)?.focus();
 }
 function closeTab(id) {
+  const t = openTabs[id];
+  // Tear down an interactive shell's tunnel + event listeners on close.
+  if (t && t.kind === 'shell') {
+    App().StopInteractiveShell(t.tid).catch(()=>{});
+    if (window.runtime) { window.runtime.EventsOff(t.evtOut); window.runtime.EventsOff(t.evtClose); }
+  }
   delete openTabs[id];
   document.querySelector(`.interact-tab[data-tid="${id}"]`)?.remove();
   document.getElementById(`ip-${id}`)?.remove();
@@ -417,7 +541,12 @@ Core commands (session & beacon):
   info                       Show agent info
   clear                      Clear the console
   shell <cmd>                Run a command in the OS shell (raw text works too)
+  shell -i  (or  pty)        Open a real-time interactive shell (session only)
   execute <path> [args]      Run a program directly (no shell wrapper)
+  grep [-r] <pattern> <path> Search file contents on the target
+  mount                      List mounted drives/filesystems
+  memfiles [list|add|rm <fd>]  Anonymous in-memory files
+  ssh <user>@<host>[:port] [-p <pass>] <cmd>   Run a command over SSH from the implant
   ps                         List processes
   ls [path]                  List files (uses current dir)
   cd <path>                  Change working directory
@@ -435,7 +564,7 @@ Core commands (session & beacon):
   env / getenv <name>        Environment variables
   setenv <K> <V>             Set an env var
   unsetenv <K>               Unset an env var
-  reg query|read|write ...   Windows registry (HKLM/HKCU/...)
+  reg query|read|write|read-hive ...   Windows registry (HKLM/HKCU/...)
   whoami                     Current token owner
   getprivs                   Token privileges (Windows)
   procdump <pid>             Dump process memory
@@ -447,10 +576,10 @@ Core commands (session & beacon):
 
 Privilege / execution (session only):
   getsystem <profile> [proc] Escalate to SYSTEM via an implant profile
-  make-token <dom> <u> <p>   Create a token from credentials
-  impersonate <user>         Impersonate a logged-on user
-  rev2self                   Drop an impersonated token
-  runas -u <u> [-p <p>] <prog> [args]   Run a program as another user
+  make-token <dom> <u> <p>   Network-cred token (like runas /netonly) for remote/SMB auth; whoami is unchanged and the password is NOT verified here
+  impersonate <user>         Steal a token from that user's already-running process (needs them logged on + high integrity; ignores password) - do NOT run after make-token
+  rev2self                   Drop the make-token / impersonate token
+  runas -u <u> [-p <p>] <prog> [args]   Launch a program under other creds on THIS host
   migrate <pid> <profile>    Migrate the implant into another process
   execute-assembly <local.exe> [args]   Run a .NET assembly (path or dialog)
   execute-shellcode <local.bin> [pid]   Inject shellcode (path or dialog)
@@ -458,6 +587,11 @@ Privilege / execution (session only):
   spawndll <local.dll> [args]           Reflectively load a DLL (path or dialog)
   extensions                            List installed + loaded extensions/BOFs
   ext <command> [args...]               Run an extension/BOF (e.g. ext sa-whoami)
+  wasm [list|register <f> [name]|exec <name> [args]]   WASM extensions
+  execute-windows [-t][-H][--ppid <pid>] <path> [args]  Execute w/ token/PPID spoof (Windows)
+  ping                                  Round-trip liveness check (session)
+  wg-forwarders / wg-list-socks         List active WireGuard forwarders / socks
+  close                                 Gracefully close this session
   backdoor <remote_pe> <profile>        Backdoor an on-disk PE with an implant
   dllhijack <ref_dll> <target> <profile>  Plant a hijacking DLL
   msf <payload> <lhost> <lport>         Run a Metasploit payload in-process
@@ -470,7 +604,7 @@ Pivoting / tunneling (session only):
   wg-portfwd add <lport> <rhost:port> | rm <id>   (WireGuard implants)
   wg-socks <port> | stop <id>                      (WireGuard implants)
   pivot  start tcp|pipe <bind> | stop <id> | list
-  services                   List Windows services
+  services [detail <name>|start <name>]   Windows services (list / inspect / start)
 
 Beacon only:
   tasks                      Show the beacon task queue
@@ -512,7 +646,10 @@ async function dispatchCmd(kind, id, raw) {
   if (cmd === 'clear') { const o = document.getElementById(`cout-${id}`); if (o) o.innerHTML = ''; return; }
   if (cmd === 'info') { const o = tab.obj; return appendOut(id, `ID: ${o.id}\nHost: ${o.hostname}\nUser: ${o.username}\nOS: ${o.os}/${o.arch}\nPID: ${o.pid}\nTransport: ${o.transport}\nRemote: ${o.remoteAddress}`, 'info'); }
   if (cmd === 'tasks' && kind === 'beacon') return showTasks(id);
-  if (cmd === 'shell' && !args.length) return appendOut(id, "usage: shell <command>  — the GUI has no interactive PTY; pass the command inline, e.g. shell whoami", 'info');
+  if ((cmd === 'shell' && (!args.length || args[0] === '-i')) || cmd === 'pty') {
+    if (kind !== 'session') return appendOut(id, '[!] interactive shell requires a session (beacons are async). For a beacon use: shell <command>', 'err');
+    return openInteractiveShell(id, tab.obj);
+  }
 
   // ── beacons: queue command, then poll for the result (non-blocking) ──
   if (kind === 'beacon') {
@@ -665,10 +802,94 @@ async function dispatchCmd(kind, id, raw) {
       return appendOut(id, pv.length ? pv.map(p => `#${p.id} ${p.type} ${p.bindAddress}`).join('\n') : '[*] no pivot listeners', 'info');
     }
     case 'services': {
+      const sub = (args[0]||'').toLowerCase();
+      if (sub === 'detail' || sub === 'info') {
+        if (!args[1]) return appendOut(id, 'usage: services detail <name>', 'err');
+        const d = await App().ServiceDetail(id, '', args[1]);
+        return appendOut(id, `Name:        ${d.name}\nDisplay:     ${d.displayName}\nStatus:      ${d.status}\nStartup:     ${d.startupType}\nAccount:     ${d.account}\nBinPath:     ${d.binPath}\nDescription: ${d.description}`, 'out');
+      }
+      if (sub === 'start') {
+        if (!args[1]) return appendOut(id, 'usage: services start <name>', 'err');
+        await App().StartServiceByName(id, '', args[1]);
+        return appendOut(id, `[+] service ${args[1]} start requested`, 'out');
+      }
       const svcs = await App().ListServices(id);
       let out = 'STATUS      NAME                           DISPLAY\n';
       svcs.forEach(s => { out += `${(s.status||'').padEnd(12)}${(s.name||'').slice(0,30).padEnd(31)}${s.displayName||''}\n`; });
       return appendOut(id, out.trimEnd(), 'out');
+    }
+    case 'grep': {
+      if (args.length < 2) return appendOut(id, 'usage: grep [-r] <pattern> <path>', 'err');
+      const recursive = args[0] === '-r';
+      const a2 = recursive ? args.slice(1) : args;
+      const pattern = a2[0], path = a2.slice(1).join(' ');
+      const res = await App().GrepFiles(id, pattern, path, recursive);
+      return appendOut(id, res, 'out');
+    }
+    case 'mount': {
+      const mounts = await App().ListMounts(id);
+      if (!mounts.length) return appendOut(id, '[*] no mounts', 'info');
+      let out = 'MOUNT           FS         TYPE       LABEL           FREE/TOTAL\n';
+      const gb = n => (n/1073741824).toFixed(1)+'G';
+      mounts.forEach(m => { out += `${(m.mountPoint||'').slice(0,14).padEnd(16)}${(m.fileSystem||'').padEnd(11)}${(m.type||'').padEnd(11)}${(m.label||'').slice(0,14).padEnd(16)}${m.totalSpace?`${gb(m.freeSpace)}/${gb(m.totalSpace)}`:''}\n`; });
+      return appendOut(id, out.trimEnd(), 'out');
+    }
+    case 'memfiles': {
+      const sub = (args[0]||'list').toLowerCase();
+      if (sub === 'add') { const fd = await App().MemfilesAdd(id); return appendOut(id, `[+] created memfile fd=${fd}`, 'out'); }
+      if (sub === 'rm')  { if (!args[1]) return appendOut(id, 'usage: memfiles rm <fd>', 'err'); await App().MemfilesRm(id, parseInt(args[1])); return appendOut(id, `[+] removed fd=${args[1]}`, 'out'); }
+      const res = await App().MemfilesList(id);
+      return appendOut(id, res, 'out');
+    }
+    case 'ssh': {
+      if (args.length < 2) return appendOut(id, 'usage: ssh <user>@<host>[:port] <command...>  (prompts nothing; add password with -p <pass>)', 'err');
+      let pass = '';
+      const pi = args.indexOf('-p');
+      if (pi >= 0) { pass = args[pi+1]||''; args.splice(pi, 2); }
+      const target = args[0]; const cmd = args.slice(1).join(' ');
+      const at = target.split('@'); if (at.length < 2) return appendOut(id, 'usage: ssh <user>@<host>[:port] <command...>', 'err');
+      const user = at[0]; const hp = at[1].split(':'); const host = hp[0]; const port = parseInt(hp[1]||'22');
+      const r = await App().SSHExec(id, host, port, user, pass, cmd);
+      if (r.error) return appendOut(id, `[error] ${r.error}`, 'err');
+      if (r.stdout) appendOut(id, r.stdout.trimEnd(), 'out');
+      if (r.stderr) appendOut(id, r.stderr.trimEnd(), 'err');
+      return;
+    }
+    case 'wasm': {
+      const sub = (args[0]||'list').toLowerCase();
+      if (sub === 'register') { if (!args[1]) return appendOut(id, 'usage: wasm register <local.wasm> [name]', 'err'); await App().RegisterWasmExtension(id, args[2]||'', args[1]); return appendOut(id, `[+] registered WASM extension`, 'out'); }
+      if (sub === 'exec') { if (!args[1]) return appendOut(id, 'usage: wasm exec <name> [args...]', 'err'); const r = await App().ExecWasmExtension(id, args[1], args.slice(2)); if (r.error) return appendOut(id, `[error] ${r.error}`, 'err'); if (r.stdout) appendOut(id, r.stdout.trimEnd(), 'out'); if (r.stderr) appendOut(id, r.stderr.trimEnd(), 'err'); return; }
+      const names = await App().ListWasmExtensions(id);
+      return appendOut(id, names.length ? names.join('\n') : '[*] no WASM extensions registered', names.length?'out':'info');
+    }
+    case 'ping': {
+      const t0 = Date.now();
+      try { await App().PingSession(id); return appendOut(id, `[+] pong (${Date.now()-t0}ms)`, 'out'); }
+      catch (e) { return appendOut(id, `[error] ${e}`, 'err'); }
+    }
+    case 'execute-windows': case 'execw': {
+      const useToken = args.includes('-t'), hide = args.includes('-H');
+      let ppid = 0; const pi = args.indexOf('--ppid'); if (pi >= 0) { ppid = parseInt(args[pi+1])||0; }
+      const rest = args.filter((a,idx) => !a.startsWith('-') && !(pi>=0 && idx===pi+1));
+      if (!rest.length) return appendOut(id, 'usage: execute-windows [-t] [-H] [--ppid <pid>] <path> [args...]', 'err');
+      const r = await App().ExecuteWindowsAdvanced(id, rest[0], rest.slice(1), useToken, hide, ppid);
+      if (r.error) return appendOut(id, `[error] ${r.error}`, 'err');
+      if (r.stdout) appendOut(id, r.stdout.trimEnd(), 'out');
+      if (r.stderr) appendOut(id, r.stderr.trimEnd(), 'err');
+      return;
+    }
+    case 'wg-forwarders': {
+      const f = await App().ListWGForwarders(id);
+      return appendOut(id, f.length ? f.map(x => `#${x.id} ${x.localAddr} -> ${x.remoteAddr}`).join('\n') : '[*] no WG forwarders', f.length?'out':'info');
+    }
+    case 'wg-list-socks': {
+      const s = await App().ListWGSocks(id);
+      return appendOut(id, s.length ? s.map(x => `#${x.id} ${x.localAddr}`).join('\n') : '[*] no WG socks servers', s.length?'out':'info');
+    }
+    case 'close': {
+      if (kind !== 'session') return appendOut(id, '[!] close applies to sessions (use kill-beacon for beacons)', 'err');
+      await App().CloseSessionGraceful(id);
+      return appendOut(id, '[+] session close requested (graceful)', 'out');
     }
     case 'mkdir': {
       if (!args[0]) return appendOut(id, 'usage: mkdir <path>', 'err');
@@ -706,7 +927,12 @@ async function dispatchCmd(kind, id, raw) {
       }
       if (sub === 'read') { const v = await App().RegistryReadValue(id, args[1], args[2], args[3]); return appendOut(id, v, 'out'); }
       if (sub === 'write') { await App().RegistryWriteValue(id, args[1], args[2], args[3], args.slice(4).join(' ')); return appendOut(id, '[+] value written', 'out'); }
-      return appendOut(id, 'usage: reg query|read|write <HIVE> <path> [key] [value]', 'err');
+      if (sub === 'read-hive') {
+        if (!args[1]) return appendOut(id, 'usage: reg read-hive <ROOT_HIVE> [requested_hive]', 'err');
+        const p = await App().RegistryReadHiveExport(id, args[1], args[2]||'');
+        return appendOut(id, `[+] hive saved to ${p}`, 'out');
+      }
+      return appendOut(id, 'usage: reg query|read|write|read-hive <HIVE> <path> [key] [value]', 'err');
     }
     case 'execute': {
       // execute [-o|-e|-t|-s ...] <path> [args] — run a program directly (no shell)
@@ -931,6 +1157,59 @@ function appendOut(id, text, cls) {
   out.appendChild(s); out.scrollTop = out.scrollHeight;
 }
 
+// ── Interactive shell (real-time PTY over a tunnel) ─────────────────────────
+// Opens as a pinned docked tab (named by machine), like the per-agent console
+// and server console — not a floating popup.
+async function openInteractiveShell(agentId, obj) {
+  const host = obj ? (obj.hostname || obj.id.slice(0,8)) : agentId;
+  const isWin = obj && (obj.os||'').toLowerCase().includes('windows');
+  let tid;
+  try {
+    tid = await App().StartInteractiveShell(agentId, '', !isWin);  // '' = implant default shell
+  } catch (e) {
+    return appendOut(agentId, `[error] could not start shell: ${e}`, 'err');
+  }
+
+  const dockId = `shell-${tid}`;
+  const evtOut = `sliver:shell:${tid}`, evtClose = `sliver:shell-closed:${tid}`;
+  // Register as a shell tab so closeTab() can tear the tunnel down.
+  openTabs[dockId] = { kind: 'shell', tid, evtOut, evtClose };
+  document.getElementById('empty-interact')?.remove();
+
+  // Tab: named by machine, with a shell glyph.
+  const tab = document.createElement('button'); tab.className = 'interact-tab'; tab.dataset.tid = dockId;
+  tab.innerHTML = `<span>▸ ${esc(host)}</span><span class="close-x" data-cid="${dockId}">x</span>`;
+  tab.addEventListener('click', e => { if (e.target.dataset.cid) closeTab(e.target.dataset.cid); else activateTab(dockId); });
+  document.getElementById('interact-tabs').appendChild(tab);
+
+  // Panel: streaming output + input line.
+  const outId = `sh-out-${tid}`, inId = `sh-in-${tid}`;
+  const panel = document.createElement('div'); panel.className = 'interact-panel'; panel.id = `ip-${dockId}`;
+  panel.innerHTML =
+    `<pre id="${outId}" class="shell-out"><span class="info">[*] interactive shell on ${esc(host)} — type 'exit' or close the tab to end.\n</span></pre>
+     <input id="${inId}" class="shell-in" placeholder="type a command and press Enter…" autocomplete="off" spellcheck="false"/>`;
+  document.getElementById('interact-panels').appendChild(panel);
+
+  const outEl = document.getElementById(outId), inEl = document.getElementById(inId);
+  const append = t => { if (!outEl) return; outEl.appendChild(document.createTextNode(t)); outEl.scrollTop = outEl.scrollHeight; };
+  const onData = b64 => { try { append(decodeB64(b64)); } catch(e){} };
+  const onClose = () => { append('\n[*] shell closed\n'); if (inEl) inEl.disabled = true; if (window.runtime){ window.runtime.EventsOff(evtOut); window.runtime.EventsOff(evtClose); } };
+  if (window.runtime) { window.runtime.EventsOn(evtOut, onData); window.runtime.EventsOn(evtClose, onClose); }
+  if (inEl) {
+    inEl.addEventListener('keydown', async e => {
+      if (e.key !== 'Enter') return;
+      const line = inEl.value; inEl.value = '';
+      if (line.trim() === 'exit') { await App().StopInteractiveShell(tid).catch(()=>{}); onClose(); return; }
+      await App().SendShellData(tid, encodeB64(line + '\n')).catch(err => append(`\n[send error] ${err}\n`));
+    });
+  }
+  activateTab(dockId);
+  setTimeout(() => inEl && inEl.focus(), 30);
+}
+// UTF-8 safe base64 helpers for shell I/O.
+function encodeB64(str){ return btoa(unescape(encodeURIComponent(str))); }
+function decodeB64(b64){ return decodeURIComponent(escape(atob(b64))); }
+
 // ── Toolbar nav (views in bottom panel for non-agent views) ────────────────
 document.querySelectorAll('.tb-btn').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -970,10 +1249,10 @@ function openNotes() {
   const t = openTabs[activeInteractId], o = t && t.obj;
   const title = `Notes — ${o ? (o.hostname || o.id.slice(0,8)) : activeInteractId}`;
   openViewPanel('_notes', title,
-    `<p style="color:var(--muted);font-size:12px;margin-bottom:8px">Notes are per-agent and kept for this session (cleared on disconnect). Auto-saved as you type.</p>
+    `<p style="color:var(--muted);font-size:12px;margin-bottom:8px">Notes are per-agent, saved locally per teamserver, and restored on reconnect. Auto-saved as you type.</p>
      <textarea id="notes-area" class="notes-area" placeholder="Credentials found, next steps, IOCs, todo...">${esc(notesMap[activeInteractId] || '')}</textarea>`);
   const ta = document.getElementById('notes-area');
-  ta.addEventListener('input', () => { notesMap[activeInteractId] = ta.value; markNoted(activeInteractId); });
+  ta.addEventListener('input', () => { notesMap[activeInteractId] = ta.value; markNoted(activeInteractId); saveState(); });
   setTimeout(() => ta.focus(), 30);
 }
 // markNoted adds a small dot to a tab that has notes.
@@ -991,8 +1270,8 @@ const SERVER_HELP = `Server console — runs teamserver commands (NOT on a targe
   jobs | listeners         list active listeners
   jobs kill <id>           kill a listener/job
   operators | players      list operators
-  loot [rm <id>]           list / remove loot
-  hosts [rm <id>]          list / remove hosts DB entries
+  loot [rm <id> | rename <id> <name>]   list / remove / rename loot
+  hosts [rm <id> | ioc-rm <ioc-id>]     list / remove hosts / remove host IOC
   creds [add <u> <p> | rm <id>]   list / add / remove credentials
   builds                   list implant builds
   regenerate <name>        re-download a previous build
@@ -1002,6 +1281,26 @@ const SERVER_HELP = `Server console — runs teamserver commands (NOT on a targe
   stager <host> <port> <profile>   start a TCP stager listener
   use <id-prefix>          interact with a session/beacon
   c2profiles               list HTTP C2 profiles
+  c2profile <name>         view a full HTTP C2 profile (JSON)
+  c2profile edit <name>    open the HTTP C2 profile editor
+  c2profile new            create a new HTTP C2 profile
+  certificates | ca        list issued / CA certificates
+  compiler                 teamserver build capabilities
+  builders                 external build servers
+  traffic-encoders         list WASM traffic encoders
+  shellcode-encoders       list shellcode encoders
+  armory                   list available armory packages
+  armory install <name>    install an armory package
+  armory remove <name>     remove an armory package
+  shellcode-rdi <dll> <func> [args]   convert a DLL to shellcode (sRDI)
+  shellcode-encode <bin> [arch] [iter]   encode shellcode (shikata-ga-nai)
+  monitor [start|stop|list|add <type> <key>|del <id>]  threat-monitoring
+  website add|update <site> <web-path> <local-file> | rm <site> <web-path>
+  pivots | pivot-graph     show the pivot (peer) topology
+  wg-client-config         generate a WireGuard client config
+  wg-unique-ip             allocate a unique WireGuard peer IP
+  creds [add|rm|update <id> <plain>|sniff <hash>|get <id>]   credential store
+  restart-jobs <id...>     restart listener jobs
   rename <id> <name>       rename a session
   kill-session <id>        kill a session
   kill-beacon <id>         remove a beacon
@@ -1072,6 +1371,7 @@ async function runServerCmd(raw) {
       }
       case 'loot': {
         if (args[0] === 'rm') { await App().DeleteLoot(args[1]); return appendServer(`[+] loot ${args[1]} removed`, 'out'); }
+        if (args[0] === 'rename') { if (args.length < 3) return appendServer('usage: loot rename <id> <new-name>', 'err'); await App().RenameLoot(args[1], args.slice(2).join(' ')); return appendServer('[+] loot renamed', 'out'); }
         const l = await App().GetLoot(); if (!l.length) return appendServer('loot store empty', 'info');
         return appendServer(l.map(x => `${x.id.slice(0,12)}  ${(x.type||'').padEnd(10)} ${x.name}`).join('\n'), 'out');
       }
@@ -1093,8 +1393,99 @@ async function runServerCmd(raw) {
       case 'kill-beacon': case 'rm-beacon': { if (!args[0]) return appendServer('usage: kill-beacon <id-prefix>', 'err'); const b = allBeacons.find(x => x.id.startsWith(args[0])); if (!b) return appendServer('no matching beacon', 'err'); await App().KillBeacon(b.id); return appendServer(`[+] removed beacon ${b.hostname}`, 'out'); }
       case 'rename': { if (args.length < 2) return appendServer('usage: rename <session-id-prefix> <new-name>', 'err'); const s = allSessions.find(x => x.id.startsWith(args[0])); if (!s) return appendServer('no matching session', 'err'); await App().RenameSession(s.id, args.slice(1).join(' ')); refreshAgents(); return appendServer('[+] renamed', 'out'); }
       case 'c2profiles': { const p = await App().ListC2Profiles(); if (!p.length) return appendServer('no HTTP C2 profiles', 'info'); return appendServer(p.map(x => x.name).join('\n'), 'out'); }
+      case 'certificates': case 'certs': {
+        const c = await App().ListCertificates(); if (!c.length) return appendServer('no certificates', 'info');
+        let o = 'CN                             TYPE            KEYALG     EXPIRES\n';
+        c.forEach(x => o += `${(x.cn||'').slice(0,30).padEnd(31)}${(x.type||'').padEnd(16)}${(x.keyAlgorithm||'').padEnd(11)}${x.validExpiry||''}\n`);
+        return appendServer(o.trimEnd(), 'out');
+      }
+      case 'compiler': case 'compiler-info': {
+        const c = await App().GetCompilerInfo();
+        let o = `server: ${c.goos}/${c.goarch}\ncross-compilers: ${(c.crossCompilers||[]).join(', ')||'none'}\ntargets:\n`;
+        (c.targets||[]).forEach(t => o += `  ${t.goos}/${t.goarch} (${t.format})\n`);
+        return appendServer(o.trimEnd(), 'out');
+      }
+      case 'builders': {
+        const b = await App().ListBuilders(); if (!b.length) return appendServer('no external builders registered', 'info');
+        return appendServer(b.map(x => `${(x.name||'').padEnd(20)} ${x.goos}/${x.goarch}  op=${x.operatorName}  [${x.templates}]`).join('\n'), 'out');
+      }
+      case 'traffic-encoders': { const t = await App().ListTrafficEncoders(); return appendServer(t.length ? t.join('\n') : 'no traffic encoders', t.length?'out':'info'); }
+      case 'shellcode-encoders': { const s = await App().ListShellcodeEncoders(); return appendServer(s.length ? s.join('\n') : 'no shellcode encoders', s.length?'out':'info'); }
+      case 'armory': {
+        const sub = (args[0]||'').toLowerCase();
+        if (sub === 'install') {
+          if (!args[1]) return appendServer('usage: armory install <name>', 'err');
+          appendServer(`[*] installing ${args[1]}...`, 'info');
+          const err = await App().ArmoryInstall(args[1]).then(() => null).catch(e => String(e));
+          return appendServer(err ? `[!] ${err}` : `[+] ${args[1]} installed`, err ? 'err' : 'out');
+        }
+        if (sub === 'remove' || sub === 'rm') {
+          if (!args[1]) return appendServer('usage: armory remove <name>', 'err');
+          const err = await App().ArmoryRemove(args[1]).then(() => null).catch(e => String(e));
+          return appendServer(err ? `[!] ${err}` : `[+] ${args[1]} removed`, err ? 'err' : 'out');
+        }
+        const pkgs = await App().ArmoryList().catch(e => { appendServer(`[!] ${e}`, 'err'); return null; });
+        if (!pkgs) return;
+        if (!pkgs.length) return appendServer('no armory packages available', 'info');
+        let out = `${'NAME'.padEnd(28)}${'TYPE'.padEnd(11)}${'INSTALLED'.padEnd(11)}DESCRIPTION
+`;
+        pkgs.forEach(p => { out += `${(p.name||'').slice(0,27).padEnd(28)}${(p.type||'').padEnd(11)}${(p.installed?'yes':'no').padEnd(11)}${(p.description||'').slice(0,50)}
+`; });
+        return appendServer(out.trimEnd(), 'out');
+      }
+      case 'restart-jobs': { if (!args.length) return appendServer('usage: restart-jobs <id> [id...]', 'err'); await App().RestartJobs(args.map(a => parseInt(a))); return appendServer(`[+] restarted jobs ${args.join(', ')}`, 'out'); }
+      case 'ca': case 'certificate-authority': {
+        const c = await App().ListCAInfo(); if (!c.length) return appendServer('no CA certificates', 'info');
+        let o = 'CN                             TYPE            KEYALG     EXPIRES\n';
+        c.forEach(x => o += `${(x.cn||'').slice(0,30).padEnd(31)}${(x.type||'').padEnd(16)}${(x.keyAlgorithm||'').padEnd(11)}${x.validExpiry||''}\n`);
+        return appendServer(o.trimEnd(), 'out');
+      }
+      case 'monitor': {
+        const sub = (args[0]||'list').toLowerCase();
+        if (sub === 'start') { await App().StartMonitor(); return appendServer('[+] monitor started', 'out'); }
+        if (sub === 'stop')  { await App().StopMonitor();  return appendServer('[+] monitor stopped', 'out'); }
+        if (sub === 'add')   { if (args.length < 3) return appendServer('usage: monitor add <type> <apikey> [apipassword]', 'err'); await App().AddMonitorConfig(args[1], args[2], args[3]||''); return appendServer('[+] monitoring provider added', 'out'); }
+        if (sub === 'del' || sub === 'rm') { if (!args[1]) return appendServer('usage: monitor del <id>', 'err'); await App().DelMonitorConfig(args[1]); return appendServer('[+] provider removed', 'out'); }
+        const p = await App().ListMonitorConfig(); if (!p.length) return appendServer('no monitoring providers configured', 'info');
+        return appendServer(p.map(x => `${(x.id||'').padEnd(16)} ${x.type}`).join('\n'), 'out');
+      }
+      case 'pivot-graph': case 'pivots': {
+        const g = await App().GetPivotGraph(); if (!g.length) return appendServer('no pivots', 'info');
+        const lines = []; const walk = (n, d) => { lines.push(`${'  '.repeat(d)}${n.hostname||n.name||('peer '+n.peerId)}`); (n.children||[]).forEach(c => walk(c, d+1)); };
+        g.forEach(n => walk(n, 0)); return appendServer(lines.join('\n'), 'out');
+      }
+      case 'wg-client-config': {
+        const c = await App().GenerateWGClientConfig();
+        return appendServer(`ClientIP:         ${c.clientIP}\nClientPrivateKey: ${c.clientPrivateKey}\nClientPubKey:     ${c.clientPubKey}\nServerPubKey:     ${c.serverPubKey}`, 'out');
+      }
+      case 'wg-unique-ip': { const ip = await App().GenerateUniqueWGIP(); return appendServer(`[+] unique WG IP: ${ip}`, 'out'); }
+      case 'dll2shellcode': case 'srdi': {
+        if (args.length < 2) return appendServer('usage: dll2shellcode <local.dll> <function> [args]', 'err');
+        const p = await App().ConvertDLLToShellcode(args[0], args[1], args.slice(2).join(' '));
+        return appendServer(`[+] shellcode saved to ${p}`, 'out');
+      }
+      case 'shellcode-encode': {
+        if (!args[0]) return appendServer('usage: shellcode-encode <local.bin> [arch=amd64] [iterations=1]', 'err');
+        const p = await App().EncodeShellcode(args[0], args[1]||'amd64', parseInt(args[2])||1);
+        return appendServer(`[+] encoded shellcode saved to ${p}`, 'out');
+      }
+      case 'c2profile': {
+        if (args[0] === 'edit') { if (!args[1]) return appendServer('usage: c2profile edit <name>', 'err'); openC2Editor(args[1]); return appendServer(`[*] editing HTTP C2 profile ${args[1]}`, 'info'); }
+        if (args[0] === 'new')  { openC2Editor(''); return appendServer('[*] new HTTP C2 profile editor opened', 'info'); }
+        if (!args[0]) return appendServer('usage: c2profile <name> | edit <name> | new   (view/edit HTTP C2 profiles)', 'err');
+        const j = await App().GetHTTPC2Profile(args[0]); return appendServer(j, 'out');
+      }
+      case 'website': {
+        const sub = (args[0]||'').toLowerCase();
+        if (sub === 'add') { if (args.length < 4) return appendServer('usage: website add <site> <web-path> <local-file>', 'err'); await App().AddWebsiteContent(args[1], args[2], args[3]); return appendServer('[+] content added', 'out'); }
+        if (sub === 'update') { if (args.length < 4) return appendServer('usage: website update <site> <web-path> <local-file>', 'err'); await App().UpdateWebsiteContent(args[1], args[2], args[3]); return appendServer('[+] content updated', 'out'); }
+        if (sub === 'rm')  { if (args.length < 3) return appendServer('usage: website rm <site> <web-path>', 'err'); await App().RemoveWebsiteContent(args[1], args[2]); return appendServer('[+] content removed', 'out'); }
+        const w = await App().ListWebsites(); if (!w || !w.length) return appendServer('no websites', 'info');
+        return appendServer(w.map(x => x.name).join('\n'), 'out');
+      }
       case 'hosts': {
         if (args[0] === 'rm') { await App().DeleteHost(args[1]); return appendServer(`[+] host ${args[1]} removed`, 'out'); }
+        if (args[0] === 'ioc-rm') { if (!args[1]) return appendServer('usage: hosts ioc-rm <ioc-id> [path] [filehash]', 'err'); await App().RemoveHostIOC(args[1], args[2]||'', args[3]||''); return appendServer('[+] host IOC removed', 'out'); }
         const h = await App().ListHosts(); if (!h.length) return appendServer('no hosts in the database', 'info');
         let o = 'HOSTNAME             OS                             UUID\n';
         h.forEach(x => o += `${(x.hostname||'').slice(0,20).padEnd(21)}${(x.os||'').slice(0,30).padEnd(31)}${(x.uuid||'').slice(0,12)}\n`);
@@ -1103,6 +1494,9 @@ async function runServerCmd(raw) {
       case 'creds': {
         if (args[0] === 'add') { if (args.length < 3) return appendServer('usage: creds add <username> <password>', 'err'); await App().AddCred(args[1], args[2], ''); return appendServer('[+] credential added', 'out'); }
         if (args[0] === 'rm') { await App().DeleteCred(args[1]); return appendServer(`[+] credential ${args[1]} removed`, 'out'); }
+        if (args[0] === 'update') { if (args.length < 3) return appendServer('usage: creds update <id> <plaintext>', 'err'); await App().UpdateCredential(args[1], '', args[2], '', true); return appendServer('[+] credential updated', 'out'); }
+        if (args[0] === 'sniff') { if (!args[1]) return appendServer('usage: creds sniff <hash>', 'err'); const ht = await App().SniffCredHashType(args[1]); return appendServer(`hash type: ${ht}`, 'out'); }
+        if (args[0] === 'get') { if (!args[1]) return appendServer('usage: creds get <id>', 'err'); const c = await App().GetCredential(args[1]); return appendServer(`ID:        ${c.id}\nUsername:  ${c.username}\nPlaintext: ${c.plaintext}\nHash:      ${c.hash}\nCracked:   ${c.cracked}`, 'out'); }
         const c = await App().ListCreds(); if (!c.length) return appendServer('no credentials stored', 'info');
         let o = 'USERNAME             PLAINTEXT / HASH\n';
         c.forEach(x => o += `${(x.username||'').slice(0,20).padEnd(21)}${x.plaintext || x.hash || ''}\n`);
@@ -1164,6 +1558,36 @@ async function openOperatorsPanel() {
 function openLootPanel() {
   openViewPanel('_loot', 'Loot', `<div style="overflow:auto;flex:1" id="loot-list"><div style="padding:10px;color:var(--muted)">Loading...</div></div>`);
   refreshLootList();
+}
+
+// HTTP C2 profile editor — load the profile as JSON, edit, save back.
+async function openC2Editor(name) {
+  openViewPanel('_c2edit', `HTTP C2 Profile${name ? ' — ' + name : ''}`,
+    `<div style="display:flex;flex-direction:column;gap:8px;flex:1;min-height:0">
+       <p style="color:var(--muted);font-size:11px;margin:0">Edit the profile JSON below. To clone it, change the <code>"name"</code> field and click <b>Save as new</b>. Malformed JSON is rejected by the teamserver.</p>
+       <textarea id="c2-json" class="notes-area" style="flex:1;min-height:260px;font-family:var(--mono);font-size:11px;line-height:1.5" spellcheck="false">Loading…</textarea>
+       <div style="display:flex;gap:8px;align-items:center">
+         <button id="c2-save" class="btn accent">Save (overwrite)</button>
+         <button id="c2-savenew" class="btn">Save as new</button>
+         <span id="c2-status" style="font-size:11px;color:var(--muted)"></span>
+       </div>
+     </div>`);
+  const ta = document.getElementById('c2-json'), status = document.getElementById('c2-status');
+  if (name) {
+    try { ta.value = await App().GetHTTPC2Profile(name); }
+    catch (e) { ta.value = ''; status.textContent = 'load error: ' + e; }
+  } else {
+    ta.value = '';
+    ta.placeholder = 'Paste an HTTP C2 profile JSON (copy one from "c2profile <name>" as a starting point).';
+  }
+  const save = async overwrite => {
+    if (!ta.value.trim()) { status.textContent = 'nothing to save'; return; }
+    status.textContent = 'saving…';
+    try { await App().SaveHTTPC2Profile(ta.value, overwrite); status.textContent = '✓ saved'; toast('ok', 'HTTP C2 profile saved'); }
+    catch (e) { status.textContent = '✕ ' + e; toast('err', String(e)); }
+  };
+  document.getElementById('c2-save').addEventListener('click', () => save(true));
+  document.getElementById('c2-savenew').addEventListener('click', () => save(false));
 }
 async function refreshLootList() {
   const el = document.getElementById('loot-list'); if (!el) return;
@@ -1414,16 +1838,33 @@ function openGeneratePanel() {
       e.preventDefault(); const f = e.target;
       const req = { name:f.name.value, goos:f.goos.value, goarch:f.goarch.value, format:f.format.value, c2Url:f.c2Url.value, debug:f.debug.checked, beacon:f.beacon.checked, interval:parseInt(f.interval?.value)||60, jitter:parseInt(f.jitter?.value)||0 };
       document.getElementById('gen-status').style.display = 'flex';
-      document.getElementById('gen-result').textContent = '';
+      const res = document.getElementById('gen-result');
+      res.textContent = '';
       const r = await App().GenerateImplant(req).catch(e => ({error:String(e)}));
       document.getElementById('gen-status').style.display = 'none';
-      const res = document.getElementById('gen-result');
-      res.textContent = r.error ? `[ERROR] ${r.error}` : `[OK] ${r.file}`;
-      res.style.color = r.error ? 'var(--accent)' : 'var(--ok)';
+      if (r.error) {
+        res.textContent = `[ERROR] ${r.error}`;
+        res.style.color = 'var(--accent)';
+        return;
+      }
+      // Build succeeded and is stored on the teamserver. Offer a local save that
+      // opens the dialog on a user click (so the spinner is gone and the dialog
+      // gets focus). The build is always retrievable from the Builds panel too.
+      res.style.color = 'var(--ok)';
+      res.innerHTML = `[OK] built <b>${esc(r.name)}</b> — stored on the teamserver. `;
+      const saveBtn = document.createElement('button');
+      saveBtn.className = 'btn small';
+      saveBtn.textContent = '💾 Save to disk';
+      saveBtn.addEventListener('click', async () => {
+        saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+        const s = await App().RegenerateBuild(r.name).catch(e => ({ error: String(e) }));
+        if (s.error) { toast('err', s.error); saveBtn.disabled = false; saveBtn.textContent = '💾 Save to disk'; }
+        else { saveBtn.textContent = '✓ Saved'; toast('ok', `Saved to ${s.path}`); }
+      });
+      res.appendChild(saveBtn);
     });
   }, 0);
 }
-
 // ── Command palette (Ctrl+K) ─────────────────────────────────────────────────
 let paletteItems = [], paletteSel = 0;
 document.addEventListener('keydown', e => {
@@ -1501,3 +1942,16 @@ async function attemptReconnect() {
 function cancelReconnect() { reconnecting = false; clearInterval(reconnectTimer); document.getElementById('reconnect-overlay').classList.add('hidden'); }
 document.getElementById('reconnect-now-btn').addEventListener('click', attemptReconnect);
 document.getElementById('reconnect-cancel-btn').addEventListener('click', async () => { cancelReconnect(); await App().Disconnect().catch(()=>{}); document.getElementById('disconnect-btn').click(); });
+
+// Show GUI build version on the connect screen once the Wails runtime is ready.
+(async function showGuiVersion() {
+  let bi = null;
+  try { bi = await App().AppVersion(); } catch (e) { /* runtime not ready or older backend */ }
+  const el = document.getElementById('gui-version');
+  if (el) {
+    el.textContent = bi && bi.version ? `${bi.version} · ${bi.gitCommit}` : '';
+    el.title = bi ? `Built ${bi.buildDate}` : '';
+  }
+  const wm = document.getElementById('panel-watermark');
+  if (wm) wm.textContent = `Sliver GUI${bi && bi.version ? ' ' + bi.version : ''} · Made by Raj Kumar Mullapudi`;
+})();

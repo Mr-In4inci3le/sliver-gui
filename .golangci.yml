@@ -1,0 +1,29 @@
+# golangci-lint configuration for Sliver GUI.
+# Kept intentionally pragmatic: correctness-focused linters on, noisy style
+# linters off, so CI stays useful without drowning contributors in nits.
+run:
+  timeout: 5m
+  build-tags:
+    - webkit2_41
+
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+    - gosimple
+    - misspell
+    - unconvert
+
+issues:
+  exclude-rules:
+    # Best-effort writes (audit log, UI event emits) intentionally ignore errors.
+    - path: audit\.go
+      linters: [errcheck]
+    # Test files may ignore errors on marshal helpers for brevity.
+    - path: _test\.go
+      linters: [errcheck]
+  max-issues-per-linter: 0
+  max-same-issues: 0

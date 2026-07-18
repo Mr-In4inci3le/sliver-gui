@@ -12,9 +12,11 @@
     <div class="logo">SLIVER<span>GUI</span></div>
     <p class="subtitle">Connect via operator config</p>
     <button id="pick-config-btn" class="btn primary full">[+] Select operator .cfg</button>
+    <input id="manual-cfg-path" placeholder="or paste path: /path/to/file.cfg" style="width:100%;margin-top:6px"/>
     <div id="config-path" class="config-path"></div>
     <button id="connect-btn" class="btn accent full" disabled>Connect</button>
     <div id="connect-error" class="error-msg"></div>
+    <div id="gui-version" class="gui-version"></div>
   </div>
 </div>
 
@@ -109,6 +111,7 @@
           <p style="margin-top:8px;color:var(--muted)">Available views: Sessions, Beacons, Listeners, Generate, Event Log, Loot, Operators</p>
         </div>
       </div>
+      <div class="panel-watermark" id="panel-watermark">Made by Raj Kumar Mullapudi</div>
     </div>
 
   </div>

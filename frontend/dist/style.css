@@ -35,6 +35,7 @@ code{font-family:var(--mono);font-size:11px;background:var(--panel-alt);padding:
 .logo{font-size:26px;font-weight:800;letter-spacing:4px;margin-bottom:6px;}
 .logo span{color:var(--accent);}
 .subtitle{color:var(--muted);margin-bottom:24px;font-size:11px;letter-spacing:.5px;}
+.gui-version{margin-top:14px;font-size:9.5px;color:var(--muted);font-family:var(--mono);letter-spacing:.5px;}
 .config-path{font-size:10px;color:var(--text-dim);margin:10px 0;word-break:break-all;min-height:12px;}
 .error-msg{color:var(--accent);font-size:11px;margin-top:8px;min-height:12px;}
 .reconnect-count{font-size:11px;color:var(--muted);margin:8px 0;}
@@ -77,7 +78,8 @@ input::placeholder{color:var(--muted);}
 /* Split layout */
 .split-layout{display:flex;flex-direction:column;flex:1;min-height:0;}
 .top-panel{flex:1;display:flex;flex-direction:column;min-height:180px;overflow:hidden;}
-.bottom-panel{height:300px;min-height:100px;display:flex;flex-direction:column;border-top:1px solid var(--border);overflow:hidden;background:var(--bg-2);}
+.bottom-panel{height:300px;min-height:100px;display:flex;flex-direction:column;border-top:1px solid var(--border);overflow:hidden;background:var(--bg-2);position:relative;}
+.panel-watermark{position:absolute;right:12px;bottom:7px;z-index:2;pointer-events:none;font-family:var(--mono);font-size:10px;letter-spacing:.4px;color:var(--muted);opacity:.5;white-space:nowrap;}
 .resize-handle{height:5px;background:var(--border);cursor:row-resize;flex-shrink:0;transition:background .12s;}
 .resize-handle:hover{background:var(--accent);}
 
@@ -190,9 +192,12 @@ input::placeholder{color:var(--muted);}
 .check-label{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--text-dim);cursor:pointer;}
 .modal-body .btn.accent{padding:10px 18px;font-size:13px;font-weight:700;}
 .gen-status{font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:8px;}
-.spinner{width:13px;height:13px;border:2px solid var(--border-hi);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite;}
+.spinner{width:13px;height:13px;border:2px solid var(--border-hi);border-top-color:var(--accent);border-radius:50%;animation:spin 1s steps(12) infinite;}
 @keyframes spin{to{transform:rotate(360deg)}}
 .result-box{font-size:12px;font-family:var(--mono);}
+.shell-out{flex:1;overflow-y:auto;margin:0;padding:10px 12px;font-family:var(--mono);font-size:12.5px;line-height:1.55;background:#08090e;color:var(--text);white-space:pre-wrap;word-break:break-word;min-height:0;}
+.shell-in{background:#0c0e14;border:none;border-top:1px solid var(--border);color:#f2d24b;font-family:var(--mono);font-size:12.5px;outline:none;padding:9px 12px;}
+.shell-in::placeholder{color:var(--muted);}
 
 /* Command palette */
 .palette-overlay{position:fixed;inset:0;z-index:9998;background:rgba(4,5,9,.55);display:flex;align-items:flex-start;justify-content:center;padding-top:14vh;}

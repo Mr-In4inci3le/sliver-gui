@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # needed to create the GitHub release + upload assets
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            os: ubuntu-24.04
+            tags: webkit2_41
+            binary: sliver-gui
+            asset: sliver-gui-linux-amd64
+          - name: windows-amd64
+            os: windows-latest
+            tags: ""
+            binary: sliver-gui.exe
+            asset: sliver-gui-windows-amd64.exe
+          - name: darwin-universal
+            os: macos-latest
+            tags: ""
+            binary: sliver-gui.app.zip
+            asset: sliver-gui-darwin-universal.app.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.6'
+          cache: true
+
+      - name: Install WebKit deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev build-essential pkg-config
+
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.9.1
+
+      - name: Copy embedded icons
+        shell: bash
+        run: cp -r frontend/icons frontend/dist/icons || true
+
+      - name: Build
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-X main.Version=${VERSION} -X main.GitCommit=${COMMIT} -X main.BuildDate=${DATE}"
+          TAGARG=""
+          if [ -n "${{ matrix.tags }}" ]; then TAGARG="-tags ${{ matrix.tags }}"; fi
+          if [ "${{ matrix.name }}" = "darwin-universal" ]; then
+            wails build $TAGARG -platform darwin/universal -ldflags "$LDFLAGS"
+            (cd build/bin && zip -r -q sliver-gui.app.zip sliver-gui.app)
+          else
+            wails build $TAGARG -ldflags "$LDFLAGS"
+          fi
+
+      - name: Stage asset + checksum
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "build/bin/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: cat dist/*.sha256 > dist/SHA256SUMS.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/sliver-gui-*
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: false

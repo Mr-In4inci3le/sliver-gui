@@ -36,12 +36,17 @@ type App struct {
 	advMu    sync.Mutex
 	socks    map[string]*socksProxyHandle // sessionID -> active socks proxy
 	portfwds map[string][]*portfwdHandle  // sessionID -> active port forwards
+	shells   map[string]*shellHandle      // tunnelID -> interactive shell
+
+	audit *auditLogger // operator action log (~/.sliver-gui/audit.log)
 }
 
 func NewApp() *App {
 	return &App{
 		socks:    map[string]*socksProxyHandle{},
 		portfwds: map[string][]*portfwdHandle{},
+		shells:   map[string]*shellHandle{},
+		audit:    newAuditLogger(),
 	}
 }
 
@@ -94,10 +99,14 @@ func (a *App) Connect(configPath string) ConnectResult {
 
 	a.startEventStream()
 
+	server := fmt.Sprintf("%s:%d", cfg.LHost, cfg.LPort)
+	a.audit.setIdentity(cfg.Operator, server)
+	a.audit.log("connect", server, "operator "+cfg.Operator)
+
 	return ConnectResult{
 		Connected:    true,
 		OperatorName: cfg.Operator,
-		Teamserver:   fmt.Sprintf("%s:%d", cfg.LHost, cfg.LPort),
+		Teamserver:   server,
 	}
 }
 
@@ -289,6 +298,7 @@ func (a *App) ExecuteCommand(sessionID, command string) ExecResult {
 	if err != nil {
 		return ExecResult{Error: err.Error()}
 	}
+	a.audit.log("command", sessionID, command)
 	sessions, _ := client.ListSessions(a.ctx)
 	var sessionOS string
 	for _, s := range sessions {
@@ -1968,6 +1978,7 @@ type GenerateRequest struct {
 
 type GenerateResult struct {
 	File  string `json:"file"`
+	Name  string `json:"name"`
 	Error string `json:"error,omitempty"`
 }
 
@@ -2040,19 +2051,14 @@ func (a *App) GenerateImplant(req GenerateRequest) GenerateResult {
 	if resp.File == nil {
 		return GenerateResult{Error: "server returned an empty build"}
 	}
-	// The compiled implant bytes come back in resp.File.Data — save them to disk
-	// via a native dialog, otherwise the build only lives on the teamserver.
-	savePath, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
-		DefaultFilename: resp.File.Name,
-		Title:           "Save generated implant",
-	})
-	if err != nil || savePath == "" {
-		return GenerateResult{Error: "build succeeded but save was cancelled — build \"" + resp.File.Name + "\" is stored on the teamserver (regenerate to download again)"}
-	}
-	if err := os.WriteFile(savePath, resp.File.Data, 0755); err != nil {
-		return GenerateResult{Error: err.Error()}
-	}
-	return GenerateResult{File: savePath}
+	// The build is now stored on the teamserver. We deliberately do NOT open a
+	// save dialog here: doing so blocked this call (and kept the "Building…"
+	// spinner up) on a modal dialog that could open behind the window. Instead we
+	// return the build name and let the frontend offer "Save to disk", which
+	// calls RegenerateBuild(name) on a user click — a dialog raised by a direct
+	// gesture gets focus, and the spinner is already gone.
+	a.audit.log("generate", genReq.Name, fmt.Sprintf("%s/%s", req.GOOS, req.GOARCH))
+	return GenerateResult{Name: genReq.Name}
 }
 
 // randSuffix returns 8 random hex chars, used to make auto-generated implant
@@ -2579,37 +2585,86 @@ type ServiceView struct {
 	Name        string `json:"name"`
 	DisplayName string `json:"displayName"`
 	Status      string `json:"status"`
+	StartupType string `json:"startupType"`
+	BinPath     string `json:"binPath"`
+	Account     string `json:"account"`
+	Description string `json:"description"`
 }
 
-// ListServices has no dedicated RPC in v1.7.3, so we fall back to an Execute of
-// PowerShell Get-Service (CSV) and parse the output — same pattern as the Env
-// and Registry tabs.
+// serviceStatusLabel maps a Windows SERVICE_STATUS code to a readable label.
+func serviceStatusLabel(code uint32) string {
+	switch code {
+	case 1:
+		return "Stopped"
+	case 2:
+		return "StartPending"
+	case 3:
+		return "StopPending"
+	case 4:
+		return "Running"
+	case 5:
+		return "ContinuePending"
+	case 6:
+		return "PausePending"
+	case 7:
+		return "Paused"
+	default:
+		return fmt.Sprintf("Unknown(%d)", code)
+	}
+}
+
+// serviceStartupLabel maps a Windows service start-type code to a label.
+func serviceStartupLabel(code uint32) string {
+	switch code {
+	case 0:
+		return "Boot"
+	case 1:
+		return "System"
+	case 2:
+		return "Automatic"
+	case 3:
+		return "Manual"
+	case 4:
+		return "Disabled"
+	default:
+		return ""
+	}
+}
+
+func serviceView(d *sliverpb.ServiceDetails) ServiceView {
+	if d == nil {
+		return ServiceView{}
+	}
+	return ServiceView{
+		Name:        d.Name,
+		DisplayName: d.DisplayName,
+		Description: d.Description,
+		Status:      serviceStatusLabel(d.Status),
+		StartupType: serviceStartupLabel(d.StartupType),
+		BinPath:     d.BinPath,
+		Account:     d.Account,
+	}
+}
+
+// ListServices enumerates Windows services on the target via the native
+// `Services` RPC. hostname may be "" for the local host.
 func (a *App) ListServices(sessionID string) ([]ServiceView, error) {
 	client, err := a.requireClient()
 	if err != nil {
 		return nil, err
 	}
-	resp, err := client.RPC.Execute(a.ctx, &sliverpb.ExecuteReq{
-		Path:    "powershell.exe",
-		Args:    []string{"-NoProfile", "-Command", "Get-Service | Select-Object Name,DisplayName,Status | ConvertTo-Csv -NoTypeInformation"},
-		Output:  true,
+	resp, err := client.RPC.Services(a.ctx, &sliverpb.ServicesReq{
 		Request: &commonpb.Request{SessionID: sessionID},
 	})
 	if err != nil {
 		return nil, err
 	}
-	out := []ServiceView{}
-	lines := strings.Split(strings.ReplaceAll(string(resp.Stdout), "\r\n", "\n"), "\n")
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || i == 0 { // skip CSV header
-			continue
-		}
-		cols := parseCSVLine(line)
-		if len(cols) < 3 {
-			continue
-		}
-		out = append(out, ServiceView{Name: cols[0], DisplayName: cols[1], Status: cols[2]})
+	if resp.Error != "" {
+		return nil, fmt.Errorf("%s", resp.Error)
+	}
+	out := make([]ServiceView, 0, len(resp.Details))
+	for _, d := range resp.Details {
+		out = append(out, serviceView(d))
 	}
 	return out, nil
 }
@@ -2754,6 +2809,14 @@ func (a *App) buildImplantConfig(req GenerateRequest) *clientpb.ImplantConfig {
 		Format:           formatFromString(req.Format),
 		C2:               []*clientpb.ImplantC2{{URL: req.C2URL, Priority: 1}},
 		ObfuscateSymbols: false,
+		// MTLS is always compiled in as a baseline transport. The generated
+		// implant's transports/session.go imports net/url, sync and sliverpb which
+		// only the MTLS/HTTP transports use; an implant that ends up with none of
+		// those (e.g. a TCP/named-pipe pivot, or any config where the scheme flag
+		// doesn't survive to the teamserver) fails to compile with "exit status 1"
+		// on those unused imports. Keeping MTLS on guarantees a buildable implant;
+		// the C2 list drives what is actually dialed, so nothing extra connects.
+		IncludeMTLS: true,
 	}
 	if req.Beacon {
 		cfg.IsBeacon = true
@@ -2776,10 +2839,18 @@ func (a *App) buildImplantConfig(req GenerateRequest) *clientpb.ImplantConfig {
 		cfg.IncludeDNS = true
 	case "wg", "wireguard":
 		cfg.IncludeWG = true
-	case "tcp":
+	case "tcp", "tcp-pivot", "tcppivot":
+		// TCP pivot implants (Sliver scheme "tcp-pivot://") ride the TCP transport.
+		// Also compile in MTLS: a pivot-ONLY implant leaves the generated
+		// transports/session.go with unused imports (net/url, sync, sliverpb) and
+		// fails to build with "exit status 1". Including the MTLS transport keeps
+		// those imports used; the C2 list still holds only the pivot URL, so
+		// nothing else is ever dialed.
 		cfg.IncludeTCP = true
-	case "namedpipe":
+		cfg.IncludeMTLS = true
+	case "namedpipe", "named-pipe":
 		cfg.IncludeNamePipe = true
+		cfg.IncludeMTLS = true
 	default:
 		cfg.IncludeMTLS = true
 	}
