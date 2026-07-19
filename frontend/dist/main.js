@@ -50,6 +50,45 @@ function toast(type, msg, dur=3000) {
   setTimeout(() => t.remove(), dur);
 }
 
+// uiConfirm / uiPrompt — in-app replacements for the browser's native
+// confirm()/prompt(). Wails' macOS WebView (WKWebView) does not implement the
+// JS dialog panels, so native confirm() returns false and prompt() returns null
+// without ever showing a dialog — silently killing any action guarded by them
+// (Kill agent, Delete build, Rename session). These are pure-DOM and work on
+// every platform. Both return a Promise.
+function uiDialog({ title, message, input, placeholder, okLabel = 'OK', danger = false }) {
+  return new Promise(resolve => {
+    const ov = document.createElement('div');
+    ov.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.5)';
+    const inputHtml = input
+      ? `<input id="ui-dlg-input" type="text" value="${(placeholder || '').replace(/"/g, '&quot;')}" style="width:100%;box-sizing:border-box;margin-top:10px;padding:7px 9px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:5px;font-size:13px">`
+      : '';
+    ov.innerHTML = `<div style="min-width:300px;max-width:440px;background:var(--panel,var(--bg));border:1px solid var(--border);border-radius:8px;padding:18px 18px 14px;box-shadow:0 8px 30px rgba(0,0,0,.4)">
+      ${title ? `<div style="font-weight:600;font-size:13.5px;margin-bottom:6px">${title}</div>` : ''}
+      <div style="font-size:13px;color:var(--muted)">${message}</div>${inputHtml}
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+        <button id="ui-dlg-cancel" class="btn small">Cancel</button>
+        <button id="ui-dlg-ok" class="btn small${danger ? ' danger' : ''}">${okLabel}</button>
+      </div></div>`;
+    document.body.appendChild(ov);
+    const inp = ov.querySelector('#ui-dlg-input');
+    if (inp) { inp.focus(); inp.select(); }
+    const done = val => { ov.remove(); document.removeEventListener('keydown', onKey); resolve(val); };
+    const onOk = () => done(input ? (inp.value || '') : true);
+    const onCancel = () => done(input ? null : false);
+    function onKey(e) {
+      if (e.key === 'Escape') onCancel();
+      else if (e.key === 'Enter') onOk();
+    }
+    ov.querySelector('#ui-dlg-ok').addEventListener('click', onOk);
+    ov.querySelector('#ui-dlg-cancel').addEventListener('click', onCancel);
+    ov.addEventListener('click', e => { if (e.target === ov) onCancel(); });
+    document.addEventListener('keydown', onKey);
+  });
+}
+function uiConfirm(message, opts = {}) { return uiDialog({ message, ...opts }); }
+function uiPrompt(message, defaultValue = '', opts = {}) { return uiDialog({ message, input: true, placeholder: defaultValue, okLabel: 'OK', ...opts }); }
+
 function isPrivileged(obj) {
   // If we've actually queried integrity for this agent, trust that over the guess.
   const lvl = (integrityMap[obj.id] || '').toLowerCase();
@@ -463,14 +502,20 @@ document.getElementById('ctx-integrity').addEventListener('click', async () => {
 });
 document.getElementById('ctx-rename').addEventListener('click', async () => {
   if (!activeCtxAgent || activeCtxAgent.kind !== 'session') return;
-  const n = prompt('New name:'); if (!n) return;
-  await App().RenameSession(activeCtxAgent.obj.id, n).catch(alert); refreshAgents();
+  const n = await uiPrompt('New name:', activeCtxAgent.obj.name || ''); if (!n) return;
+  await App().RenameSession(activeCtxAgent.obj.id, n)
+    .then(() => toast('ok', 'Session renamed'))
+    .catch(e => toast('err', 'Rename failed: ' + e));
+  refreshAgents();
 });
 document.getElementById('ctx-kill').addEventListener('click', async () => {
   if (!activeCtxAgent) return;
-  if (!confirm('Kill this agent?')) return;
-  if (activeCtxAgent.kind === 'session') await App().KillSession(activeCtxAgent.obj.id).catch(alert);
-  else await App().KillBeacon(activeCtxAgent.obj.id).catch(alert);
+  const { kind, obj } = activeCtxAgent;
+  if (!(await uiConfirm(`Kill ${kind} on ${obj.hostname || obj.id}?`, { title: 'Kill agent', okLabel: 'Kill', danger: true }))) return;
+  const call = kind === 'session' ? App().KillSession(obj.id) : App().KillBeacon(obj.id);
+  await call
+    .then(() => toast('ok', `Killed ${kind} ${obj.hostname || ''}`.trim()))
+    .catch(e => toast('err', 'Kill failed: ' + e));
   refreshAgents();
 });
 
@@ -1651,7 +1696,13 @@ async function refreshBuildsList() {
   const el = document.getElementById('builds-list'); if (!el) return;
   const builds = await App().GetBuildHistory().catch(() => []);
   if (!builds?.length) { el.innerHTML = '<div style="padding:10px;color:var(--muted)">No builds yet.</div>'; return; }
-  el.innerHTML = builds.map(b => `<div style="padding:4px 10px;font-size:12.5px;display:flex;gap:10px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1">${esc(b.name)}</span><span style="color:var(--muted)">${esc(b.goos)}/${esc(b.goarch)}</span><span style="color:var(--muted)">${esc(b.format)}</span><span style="color:var(--muted);font-family:var(--mono);max-width:180px;overflow:hidden;text-overflow:ellipsis">${esc((b.c2Urls||[]).join(','))}</span><button class="btn small" onclick="buildRegen('${esc(b.name)}')">Download</button><button class="btn small danger" onclick="if(confirm('Delete build ${esc(b.name)}?'))App().DeleteBuild('${esc(b.name)}').then(refreshBuildsList)">Del</button></div>`).join('');
+  el.innerHTML = builds.map(b => `<div style="padding:4px 10px;font-size:12.5px;display:flex;gap:10px;align-items:center;border-bottom:1px solid var(--border)"><span style="flex:1">${esc(b.name)}</span><span style="color:var(--muted)">${esc(b.goos)}/${esc(b.goarch)}</span><span style="color:var(--muted)">${esc(b.format)}</span><span style="color:var(--muted);font-family:var(--mono);max-width:180px;overflow:hidden;text-overflow:ellipsis">${esc((b.c2Urls||[]).join(','))}</span><button class="btn small" onclick="buildRegen('${esc(b.name)}')">Download</button><button class="btn small danger" onclick="deleteBuild('${esc(b.name)}')">Del</button></div>`).join('');
+}
+async function deleteBuild(name) {
+  if (!(await uiConfirm(`Delete build ${esc(name)}?`, { title: 'Delete build', okLabel: 'Delete', danger: true }))) return;
+  await App().DeleteBuild(name)
+    .then(() => { toast('ok', `Deleted build ${name}`); refreshBuildsList(); })
+    .catch(e => toast('err', 'Delete failed: ' + e));
 }
 async function buildRegen(name) {
   const r = await App().RegenerateBuild(name).catch(e => ({ error: String(e) }));
