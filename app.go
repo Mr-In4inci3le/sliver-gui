@@ -64,8 +64,36 @@ func (a *App) shutdown(ctx context.Context) {
 
 // ─── Connection ───────────────────────────────────────────────────────────────
 
+// safeOpenFileDialog wraps runtime.OpenFileDialog with a nil-ctx check and panic
+// recovery to prevent app crashes if native OS file dialogs fail on Windows/Linux.
+func (a *App) safeOpenFileDialog(opts runtime.OpenDialogOptions) (res string, err error) {
+	if a.ctx == nil {
+		return "", fmt.Errorf("application context not initialized")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("file dialog error: %v", r)
+		}
+	}()
+	return runtime.OpenFileDialog(a.ctx, opts)
+}
+
+// safeSaveFileDialog wraps runtime.SaveFileDialog with a nil-ctx check and panic
+// recovery to prevent app crashes if native OS file dialogs fail on Windows/Linux.
+func (a *App) safeSaveFileDialog(opts runtime.SaveDialogOptions) (res string, err error) {
+	if a.ctx == nil {
+		return "", fmt.Errorf("application context not initialized")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("file dialog error: %v", r)
+		}
+	}()
+	return runtime.SaveFileDialog(a.ctx, opts)
+}
+
 func (a *App) PickConfigFile() (string, error) {
-	return runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+	return a.safeOpenFileDialog(runtime.OpenDialogOptions{
 		Title:   "Select Sliver operator config (.cfg)",
 		Filters: []runtime.FileFilter{{DisplayName: "Sliver Config (*.cfg)", Pattern: "*.cfg"}},
 	})
@@ -868,7 +896,7 @@ func (a *App) ProcessDump(sessionID string, pid int32) TransferResult {
 	if err != nil {
 		return TransferResult{Error: err.Error()}
 	}
-	savePath, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+	savePath, err := a.safeSaveFileDialog(runtime.SaveDialogOptions{
 		DefaultFilename: fmt.Sprintf("procdump_%d.dmp", pid),
 		Title:           "Save process dump",
 	})
@@ -918,7 +946,7 @@ func (a *App) DownloadFile(sessionID, remotePath string) TransferResult {
 	if err != nil {
 		return TransferResult{Error: "decode: " + err.Error()}
 	}
-	savePath, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+	savePath, err := a.safeSaveFileDialog(runtime.SaveDialogOptions{
 		DefaultFilename: filepath.Base(remotePath),
 		Title:           "Save downloaded file",
 	})
@@ -950,7 +978,7 @@ func (a *App) UploadFile(sessionID, remotePath string) TransferResult {
 	if err != nil {
 		return TransferResult{Error: err.Error()}
 	}
-	localPath, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+	localPath, err := a.safeOpenFileDialog(runtime.OpenDialogOptions{
 		Title: "Select file to upload",
 	})
 	if err != nil || localPath == "" {
@@ -1295,7 +1323,7 @@ func (a *App) RegenerateBuild(name string) TransferResult {
 	if resp.File == nil {
 		return TransferResult{Error: "no stored build for " + name}
 	}
-	savePath, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+	savePath, err := a.safeSaveFileDialog(runtime.SaveDialogOptions{
 		DefaultFilename: resp.File.Name,
 		Title:           "Save regenerated implant",
 	})
@@ -1660,7 +1688,7 @@ func (a *App) DownloadLoot(lootID string) TransferResult {
 	if resp.File == nil {
 		return TransferResult{Error: "this loot item has no file content"}
 	}
-	savePath, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+	savePath, err := a.safeSaveFileDialog(runtime.SaveDialogOptions{
 		DefaultFilename: resp.File.Name,
 		Title:           "Save loot",
 	})
@@ -2522,7 +2550,7 @@ type AssemblyResult struct {
 // an explicit path (execute-assembly <path>) or fall back to a picker.
 func (a *App) readLocalOrDialog(localPath, title string) ([]byte, error) {
 	if localPath == "" {
-		p, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{Title: title})
+		p, err := a.safeOpenFileDialog(runtime.OpenDialogOptions{Title: title})
 		if err != nil || p == "" {
 			return nil, fmt.Errorf("selection cancelled")
 		}

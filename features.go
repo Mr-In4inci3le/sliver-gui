@@ -210,7 +210,7 @@ func (a *App) RegistryReadHiveExport(sessionID, rootHive, requestedHive string) 
 			data = dec
 		}
 	}
-	savePath, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+	savePath, err := a.safeSaveFileDialog(runtime.SaveDialogOptions{
 		DefaultFilename: strings.ToLower(rootHive) + ".hive",
 		Title:           "Save registry hive",
 	})
@@ -959,7 +959,7 @@ func (a *App) ConvertDLLToShellcode(dllPath, functionName, args string) (string,
 	if err != nil {
 		return "", err
 	}
-	savePath, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+	savePath, err := a.safeSaveFileDialog(runtime.SaveDialogOptions{
 		DefaultFilename: strings.TrimSuffix(filepath.Base(dllPath), filepath.Ext(dllPath)) + ".bin",
 		Title:           "Save shellcode",
 	})
@@ -999,7 +999,7 @@ func (a *App) EncodeShellcode(inPath, architecture string, iterations int) (stri
 	if err != nil {
 		return "", err
 	}
-	savePath, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+	savePath, err := a.safeSaveFileDialog(runtime.SaveDialogOptions{
 		DefaultFilename: strings.TrimSuffix(filepath.Base(inPath), filepath.Ext(inPath)) + ".enc.bin",
 		Title:           "Save encoded shellcode",
 	})

@@ -39,6 +39,10 @@
       <button class="tb-btn" data-view="creds">Creds</button>
       <button class="tb-btn" data-view="hosts">Hosts</button>
       <button class="tb-btn" data-view="operators">Operators</button>
+      <button class="tb-btn" data-view="scripts">Scripts</button>
+      <button class="tb-btn" data-view="iocs">IOCs</button>
+      <button class="tb-btn" data-view="report">Report</button>
+      <button class="tb-btn" data-view="c2profiles">C2 Profiles</button>
     </div>
     <div class="toolbar-right">
       <span id="server-version" class="version-tag"></span>
@@ -67,8 +71,8 @@
         <div class="table-wrap">
           <table class="data-table" id="agents-table">
             <thead><tr>
-              <th>Type</th><th>Name / ID</th><th>Host</th><th>User</th><th>OS/Arch</th>
-              <th>PID</th><th>Transport</th><th>Remote</th><th>Last Checkin</th><th>Status</th>
+              <th>Type</th><th>Name / ID</th><th>Host</th><th>User</th><th>Remote IP</th><th>OS/Arch</th>
+              <th>PID</th><th>Transport</th><th>Last Checkin</th><th>Status</th>
             </tr></thead>
             <tbody id="agents-body"></tbody>
           </table>
@@ -79,14 +83,16 @@
       <div id="graph-view" class="panel-content hidden">
         <svg id="graph-svg" xmlns="http://www.w3.org/2000/svg"></svg>
         <div class="graph-legend">
-          <span class="leg-item"><span class="leg-line priv"></span> Privileged (red)</span>
-          <span class="leg-item"><span class="leg-line user"></span> User session (green)</span>
-          <span class="leg-item"><span class="leg-line beacon"></span> Beacon (blue dashed)</span>
-          <span class="leg-item"><span class="leg-line dead"></span> Dead (grey)</span>
+          <span class="leg-item"><span class="leg-line" style="border-top:3px solid #35c46b"></span> User session</span>
+          <span class="leg-item"><span class="leg-line" style="border-top:3px solid #e23c4e"></span> Privileged session</span>
+          <span class="leg-item"><span class="leg-line" style="border-top:3px solid #4d9fe6"></span> Beacon</span>
+          <span class="leg-item"><span class="leg-line" style="border-top:3px dashed #f5a623"></span> Jump / Lateral move</span>
+          <span class="leg-item"><span class="leg-line" style="border-top:3px solid #6b7280;opacity:.6"></span> Dead agent</span>
           <span class="sep">|</span>
-          <span class="leg-item">OS logo + integrity shown per node</span>
+          <span class="leg-item"><span style="display:inline-block;width:10px;height:10px;border:1.5px dashed #35c46b;border-radius:2px;vertical-align:middle;margin-right:4px"></span> Active selection</span>
+          <span class="leg-item"><span style="display:inline-block;width:10px;height:10px;border:1.2px dashed #f5a623;border-radius:2px;vertical-align:middle;margin-right:4px"></span> Jump-linked node</span>
           <span class="sep">|</span>
-          <span class="leg-item">drag nodes · scroll to zoom · drag bg to pan</span>
+          <span class="leg-item" style="color:var(--muted)">drag · scroll zoom · drag bg to pan</span>
           <span class="spacer"></span>
           <button id="graph-reset-btn" class="btn small">Reset Layout</button>
         </div>
@@ -151,6 +157,8 @@
 <!-- Context menu -->
 <div id="ctx-menu" class="ctx-menu hidden">
   <div class="ctx-item" id="ctx-interact">Interact</div>
+  <div class="ctx-item" id="ctx-files">File Browser</div>
+  <div class="ctx-item" id="ctx-processes">Process Browser</div>
   <div class="ctx-item" id="ctx-integrity">Check Integrity</div>
   <div class="ctx-item" id="ctx-rename">Rename</div>
   <div class="ctx-divider"></div>

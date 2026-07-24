@@ -46,10 +46,6 @@ directly: no grpc-web proxy, no protocol reimplementation, no drift when upstrea
 <img width="1912" height="832" alt="image" src="https://github.com/user-attachments/assets/5db41809-17f4-40e2-bf7c-20a5a4901666" />
 <br><br>
 <img width="1912" height="756" alt="image" src="https://github.com/user-attachments/assets/b779ca54-7b43-4d0d-b066-66e25d7f73aa" />
-<br><br>
-<img width="1912" height="802" alt="image" src="https://github.com/user-attachments/assets/e43bcdc2-3c84-4ad2-8010-aa43c88d4b5d" />
-<br><br>
-<img width="1913" height="807" alt="Screenshot 2026-07-18 014308" src="https://github.com/user-attachments/assets/5780d98a-8e5e-4683-90bc-3649587d4b00" />
 
 ---
 
@@ -83,6 +79,43 @@ shellcode-encoders · armory [install/remove] · websites · canaries · stager 
 kill-session · kill-beacon · version · mtls/http/https/dns/wg`
 
 </details>
+
+---
+
+## Operator Toolkit — Script Manager, Panels & Pivot Graph
+
+> A cohesive operator layer on top of Sliver's RPCs — **designed and built by
+> [Mr-In4inci3le](https://github.com/Mr-In4inci3le) aka Raj Kumar Mullapudi.** No C2 logic is
+> reimplemented; every action composes existing Sliver RPCs.
+
+### Script Manager
+One-click post-exploitation **recipes** (Cobalt-Strike-style jump / spawn / remote-exec), each with a
+**dry-run preview**, a **MITRE ATT&CK ID**, and an **OpSec noise** rating:
+
+- **Spawn** — `spawn <os> <arch> <profile>` builds + runs a fresh agent on the current host, with a
+  pre-flight **listener check** and **post-spawn verification** (reports the real new agent ID).
+- **Lateral Movement** — SSH deploy, PsExec, WMI, WinRM, SC, SMB (`jump ssh|psexec|winrm|wmi`).
+- **Privilege Escalation** — Linux (sudo / SUID), Windows (privesc check, token impersonation,
+  GetSystem, UAC bypass).
+- **Persistence** — cron · SSH-key · systemd · Registry Run · scheduled task · service · WMI · startup.
+- **Credentials** — Linux & Windows harvest, Kerberoast, DCSync (harvested creds routed to Loot).
+- **Enumeration** — network scan, Active Directory enumeration, local Windows enum.
+
+### Operator Panels
+- **File Browser** — visual remote filesystem (list / delete).
+- **Process Browser** — visual process list + kill.
+- **Kill-Chain Tracker** — record and visualise the current engagement stage.
+- **Engagement Timer** — start / elapsed stopwatch.
+- **IOC Tracker** — log indicators as you drop them (files, registry keys, services).
+- **Cleanup Script Generator** — emit a teardown script from the tracked IOCs.
+- **Engagement Report Generator** — one-click engagement report.
+
+### Interactive Pivot / Jump Graph
+A Cobalt-Strike-style topology view: a **firewall / egress boundary** on the left, agents laid out
+left-to-right in their **real pivot order** (chains joined by session id so same-host pivots render
+correctly), edges colour-coded by agent (**green** session · **red** SYSTEM/privileged · **blue**
+beacon), and **orange dashed lateral-move edges** that show exactly where each jump came from.
+Drag nodes · scroll-zoom · pan · per-teamserver saved layout · one-click **Reset Layout**.
 
 ---
 

