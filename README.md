@@ -117,6 +117,14 @@ correctly), edges colour-coded by agent (**green** session · **red** SYSTEM/pri
 beacon), and **orange dashed lateral-move edges** that show exactly where each jump came from.
 Drag nodes · scroll-zoom · pan · per-teamserver saved layout · one-click **Reset Layout**.
 
+<img width="1907" height="833" alt="Screenshot 2026-07-24 132107" src="https://github.com/user-attachments/assets/913aeb82-36bb-4594-8bf3-9afd440df910" />
+<br><br>
+<img width="1907" height="838" alt="Screenshot 2026-07-24 072453" src="https://github.com/user-attachments/assets/0af99b08-69cf-40a4-9625-fcb31e961eb1" />
+<br><br>
+<img width="1915" height="828" alt="Screenshot 2026-07-24 072413" src="https://github.com/user-attachments/assets/f5fa5e54-c8f5-4bcc-b4e8-518398153587" />
+<br><br>
+<img width="1087" height="492" alt="Screenshot 2026-07-24 003243" src="https://github.com/user-attachments/assets/eb4a6db4-31a6-416b-bf51-a84111964b0d" />
+
 ---
 
 ## Quick start
