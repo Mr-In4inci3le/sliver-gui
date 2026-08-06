@@ -2791,8 +2791,15 @@ function openGeneratePanel() {
       const r = await App().GenerateImplant(req).catch(e => ({error:String(e)}));
       document.getElementById('gen-status').style.display = 'none';
       const res = document.getElementById('gen-result');
-      res.textContent = r.error ? `[ERROR] ${r.error}` : `[OK] ${r.file}`;
-      res.style.color = r.error ? 'var(--accent)' : 'var(--ok)';
+      if (r.error) {
+        res.textContent = `[ERROR] ${r.error}`;
+        res.style.color = 'var(--accent)';
+      } else {
+        res.style.color = 'var(--ok)';
+        res.innerHTML = `<span>[OK] Build created: ${esc(r.name || r.file)}</span> <button class="btn small" style="margin-left:10px" onclick="buildRegen('${esc(r.name || r.file)}')">⬇ Save to disk</button>`;
+        // Auto-trigger the native save dialog immediately
+        buildRegen(r.name || r.file);
+      }
     });
   }, 0);
 }

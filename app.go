@@ -1323,8 +1323,12 @@ func (a *App) RegenerateBuild(name string) TransferResult {
 	if resp.File == nil {
 		return TransferResult{Error: "no stored build for " + name}
 	}
+	defaultName := resp.File.Name
+	if defaultName == "" {
+		defaultName = name
+	}
 	savePath, err := a.safeSaveFileDialog(runtime.SaveDialogOptions{
-		DefaultFilename: resp.File.Name,
+		DefaultFilename: defaultName,
 		Title:           "Save regenerated implant",
 	})
 	if err != nil || savePath == "" {
@@ -2086,7 +2090,7 @@ func (a *App) GenerateImplant(req GenerateRequest) GenerateResult {
 	// calls RegenerateBuild(name) on a user click — a dialog raised by a direct
 	// gesture gets focus, and the spinner is already gone.
 	a.audit.log("generate", genReq.Name, fmt.Sprintf("%s/%s", req.GOOS, req.GOARCH))
-	return GenerateResult{Name: genReq.Name}
+	return GenerateResult{Name: genReq.Name, File: genReq.Name}
 }
 
 // randSuffix returns 8 random hex chars, used to make auto-generated implant
