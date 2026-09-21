@@ -1232,16 +1232,56 @@ type RportFwdView struct {
 	Forward string `json:"forward"`
 }
 
+// rportJoinHostPort builds the "host:port" string Sliver's rportfwd expects.
+// Sliver parses BindAddress/ForwardAddress as full host:port strings and ignores
+// the separate numeric BindPort/ForwardPort proto fields (the implant does
+// tcpProxy.AddRoute(req.BindAddress, ...) and the official sliver-client leaves
+// the numeric fields unset). Sending a bare host + separate port — as this code
+// used to — makes the implant try to listen on an address with no port, so the
+// forward silently never works (issue #5). An empty host binds to all
+// interfaces (":port"), matching the official client.
+func rportJoinHostPort(host string, port int) string {
+	host = strings.TrimSpace(host)
+	if strings.Contains(host, ":") { // caller already supplied host:port — leave it
+		return host
+	}
+	if host == "" {
+		return fmt.Sprintf(":%d", port)
+	}
+	return fmt.Sprintf("%s:%d", host, port)
+}
+
+// rportAddrString renders a listener address for display. Sliver returns the
+// full host:port in the address string with the numeric port field left at 0,
+// so we use the string as-is and only fall back to combining a bare host with a
+// nonzero port field (defensive against older/edge server responses). The old
+// code always did fmt.Sprintf("%s:%d", addr, port), producing "0.0.0.0:0" — the
+// "different output" from issue #5.
+func rportAddrString(addr string, port uint32) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		if port == 0 {
+			return ""
+		}
+		return fmt.Sprintf(":%d", port)
+	}
+	if strings.Contains(addr, ":") || port == 0 {
+		return addr
+	}
+	return fmt.Sprintf("%s:%d", addr, port)
+}
+
 func (a *App) StartRportFwd(sessionID, bindAddr string, bindPort int, fwdAddr string, fwdPort int) error {
 	client, err := a.requireClient()
 	if err != nil {
 		return err
 	}
 	_, err = client.RPC.StartRportFwdListener(a.ctx, &sliverpb.RportFwdStartListenerReq{
-		BindAddress:    bindAddr,
-		BindPort:       uint32(bindPort),
-		ForwardAddress: fwdAddr,
-		ForwardPort:    uint32(fwdPort),
+		// Sliver reads these as full host:port strings and ignores BindPort/
+		// ForwardPort, so combine them here (matches sliver-client).
+		BindAddress:    rportJoinHostPort(bindAddr, bindPort),
+		ForwardAddress: rportJoinHostPort(fwdAddr, fwdPort),
+		KeepAlive:      -1,
 		Request:        &commonpb.Request{SessionID: sessionID},
 	})
 	return err
@@ -1262,8 +1302,8 @@ func (a *App) ListRportFwds(sessionID string) ([]RportFwdView, error) {
 	for _, l := range resp.Listeners {
 		out = append(out, RportFwdView{
 			ID:      l.ID,
-			Bind:    fmt.Sprintf("%s:%d", l.BindAddress, l.BindPort),
-			Forward: fmt.Sprintf("%s:%d", l.ForwardAddress, l.ForwardPort),
+			Bind:    rportAddrString(l.BindAddress, l.BindPort),
+			Forward: rportAddrString(l.ForwardAddress, l.ForwardPort),
 		})
 	}
 	return out, nil

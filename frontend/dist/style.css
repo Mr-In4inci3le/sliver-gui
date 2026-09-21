@@ -37,6 +37,16 @@ code{font-family:var(--mono);font-size:11px;background:var(--panel-alt);padding:
 .subtitle{color:var(--muted);margin-bottom:24px;font-size:11px;letter-spacing:.5px;}
 .gui-version{margin-top:14px;font-size:9.5px;color:var(--muted);font-family:var(--mono);letter-spacing:.5px;}
 .config-path{font-size:10px;color:var(--text-dim);margin:10px 0;word-break:break-all;min-height:12px;}
+/* Saved operator configs list (connect screen) */
+.saved-configs{display:flex;flex-direction:column;gap:6px;margin-bottom:12px;max-height:190px;overflow-y:auto;text-align:left;}
+.cfg-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border:1px solid var(--border-hi);border-radius:8px;background:var(--bg);cursor:pointer;transition:border-color .12s,background .12s;}
+.cfg-row:hover{background:var(--panel-hi,rgba(255,255,255,.04));}
+.cfg-row.selected{border-color:var(--accent);background:rgba(226,60,78,.10);}
+.cfg-meta{display:flex;flex-direction:column;gap:2px;overflow:hidden;}
+.cfg-name{font-size:12px;color:var(--text);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.cfg-server{font-size:10px;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.cfg-del{flex:none;border:none;background:transparent;color:var(--text-dim);font-size:12px;cursor:pointer;padding:2px 6px;border-radius:6px;line-height:1;}
+.cfg-del:hover{color:var(--accent);background:rgba(226,60,78,.12);}
 .error-msg{color:var(--accent);font-size:11px;margin-top:8px;min-height:12px;}
 .reconnect-count{font-size:11px;color:var(--muted);margin:8px 0;}
 .reconnect-count span{color:var(--warn);font-weight:700;}

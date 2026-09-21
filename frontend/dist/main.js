@@ -131,19 +131,84 @@ function shortUser(u) { u = u || '?'; const i = u.lastIndexOf('\\'); return i >=
 function fmtDur(ns) { const n = Number(ns) || 0; return n > 1e6 ? `${Math.round(n/1e9)}s` : `${n}s`; }
 
 // ── Connect ────────────────────────────────────────────────────────────────
+const LAST_CFG_KEY = 'sliver-gui:lastConfig';
+
+// selectConfig marks a config path as the one to connect with: fills the label,
+// enables the Connect button, and highlights the matching saved-config row.
+function selectConfig(path) {
+  selectedConfigPath = path;
+  document.getElementById('config-path').textContent = path || '';
+  document.getElementById('connect-btn').disabled = !path;
+  document.querySelectorAll('#saved-configs .cfg-row').forEach(el => {
+    el.classList.toggle('selected', el.dataset.path === path);
+  });
+}
+
+// renderSavedConfigs pulls the discovered .cfg list from the backend
+// (~/.sliver-gui/configs + ~/.sliver-client/configs) so the operator can pick a
+// teamserver without re-selecting a file every launch (issue #4).
+async function renderSavedConfigs() {
+  const box = document.getElementById('saved-configs');
+  if (!box) return;
+  let list = [];
+  try { list = await App().ListSavedConfigs(); } catch (e) { list = []; }
+  box.innerHTML = '';
+  if (!list || !list.length) { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  const last = localStorage.getItem(LAST_CFG_KEY);
+  list.forEach(c => {
+    const row = document.createElement('div');
+    row.className = 'cfg-row';
+    row.dataset.path = c.path;
+    const meta = document.createElement('div'); meta.className = 'cfg-meta';
+    meta.innerHTML = `<span class="cfg-name">${c.operator || c.name || '(config)'}</span>` +
+                     `<span class="cfg-server">${c.teamserver || c.path}</span>`;
+    row.appendChild(meta);
+    // Remove control — only for app-managed configs (never the sliver-client dir).
+    if (c.managed) {
+      const del = document.createElement('button');
+      del.className = 'cfg-del'; del.textContent = '✕'; del.title = 'Remove from list';
+      del.addEventListener('click', async (ev) => {
+        ev.stopPropagation();
+        try { await App().RemoveSavedConfig(c.path); } catch (e) {}
+        if (selectedConfigPath === c.path) selectConfig(null);
+        renderSavedConfigs();
+      });
+      row.appendChild(del);
+    }
+    row.addEventListener('click', () => selectConfig(c.path));
+    row.addEventListener('dblclick', () => { selectConfig(c.path); document.getElementById('connect-btn').click(); });
+    box.appendChild(row);
+    if (c.path === last) selectConfig(c.path); // pre-select last used → one-click connect
+  });
+}
+
 document.getElementById('pick-config-btn').addEventListener('click', async () => {
   const path = await App().PickConfigFile().catch(() => null);
-  if (path) { selectedConfigPath = path; document.getElementById('config-path').textContent = path; document.getElementById('connect-btn').disabled = false; }
+  if (!path) return;
+  // Persist the picked config into the app store so it survives restarts, then
+  // select it. Fall back to using the raw path if the import fails.
+  try {
+    const saved = await App().ImportConfig(path);
+    await renderSavedConfigs();
+    selectConfig(saved.path);
+  } catch (e) {
+    document.getElementById('connect-error').textContent = String(e);
+    selectConfig(path);
+  }
 });
-document.getElementById('manual-cfg-path').addEventListener('input', function() { var p = this.value.trim(); if (p) { selectedConfigPath = p; document.getElementById('config-path').textContent = p; document.getElementById('connect-btn').disabled = false; } });
+document.getElementById('manual-cfg-path').addEventListener('input', function() { var p = this.value.trim(); if (p) selectConfig(p); });
 document.getElementById('connect-btn').addEventListener('click', async () => {
   const btn = document.getElementById('connect-btn');
   btn.disabled = true; btn.textContent = 'Connecting...';
   const r = await App().Connect(selectedConfigPath).catch(e => ({ error: String(e) }));
   if (r.error) { document.getElementById('connect-error').textContent = r.error; btn.disabled = false; btn.textContent = 'Connect'; return; }
   lastConfigPath = selectedConfigPath;
+  try { localStorage.setItem(LAST_CFG_KEY, selectedConfigPath); } catch (e) {}
   enterApp(r);
 });
+// Populate the saved-config list as soon as the Wails runtime is ready.
+renderSavedConfigs();
 
 async function enterApp(info) {
   document.getElementById('connect-overlay').classList.add('hidden');
